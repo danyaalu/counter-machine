@@ -14,12 +14,44 @@ Compile the program using gcc:
 gcc -o countermachine main.c
 ```
 
+## Setup
+
+To get started quickly, copy the example files:
+
+```bash
+cp program-example.txt program.txt
+cp registers-example.txt registers.txt
+```
+
+These example files contain a working program that you can run immediately. You can then modify `program.txt` and `registers.txt` to create your own programs.
+
 ## Running
 
 To run a counter machine program:
 
 ```bash
 ./countermachine
+```
+
+### Debug Mode
+
+To see detailed execution information for each step, run with the `-d` flag:
+
+```bash
+./countermachine -d
+```
+
+Debug mode displays:
+- Step number
+- Current program counter (PC) and instruction being executed
+- Instruction details with operands
+- Register values before executing each instruction
+
+Example debug output:
+```
+1 [10, 15, 0, 0]
+2 [10, 15, 0, 0]
+3 [10, 14, 0, 0]
 ```
 
 The simulator will:
