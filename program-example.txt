@@ -1,6 +1,5 @@
-# Example Counter Machine Program
-IF 1 5     
-DEC 1      
-INC 2      
-GOTO 1     
+IF 1 5
+DEC 1
+INC 2
+GOTO 1
 HALT

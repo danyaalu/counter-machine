@@ -137,6 +137,37 @@ Instr *load_program(const char *filename, size_t *out_instruction_count)
     return instruction_list;
 }
 
+RegFile load_registers(const char *filename)
+{
+    FILE *file = fopen(filename, "r");
+    if (!file)
+    {
+        perror("Error opening register file");
+        exit(1);
+    }
+
+    RegFile regFile;
+    regFile.r = NULL;
+    regFile.size = 0;
+
+    uint64_t value;
+    size_t allocated_capacity = 0;
+
+    while (fscanf(file, "%llu", &value) == 1)
+    {
+        if (regFile.size >= allocated_capacity)
+        {
+            allocated_capacity = (allocated_capacity == 0) ? 8 : allocated_capacity * 2;
+            regFile.r = realloc(regFile.r, allocated_capacity * sizeof(uint64_t));
+        }
+
+        regFile.r[regFile.size++] = value;
+    }
+
+    fclose(file);
+    return regFile;
+}
+
 void run_program(const Instr *instruction_list,
                  size_t instruction_count,
                  RegFile *register_file)
@@ -238,16 +269,7 @@ int main()
 {
     size_t program_length;
     Instr *program = load_program("program.txt", &program_length);
-
-    // Set registers
-    RegFile regFile;
-    regFile.size = 4;
-    regFile.r = malloc(regFile.size * sizeof(uint64_t));
-
-    regFile.r[0] = 15;
-    regFile.r[1] = 21;
-    regFile.r[2] = 0;
-    regFile.r[3] = 0;
+    RegFile regFile = load_registers("registers.txt");
 
     // Run program
     run_program(program, program_length, &regFile);

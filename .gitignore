@@ -1,3 +1,7 @@
+# Program related files and programs.
 program.txt
+registers.txt
 countermachine
+
+# IDE files and dirs 
 .vscode/
