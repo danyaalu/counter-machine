@@ -68,6 +68,53 @@ def is_halt_reachable(program):
     
     return True
 
+def normalize_program(program, max_register):
+    register_map = {}
+    next_register = 1
+    normalized = []
+    
+    for instruction in program:
+        if instruction == 'HALT':
+            normalized.append('HALT')
+            continue
+            
+        parts = instruction.split()
+        opcode = parts[0]
+        
+        # Process register references and map them to canonical names
+        if opcode in ['IF', 'DEC', 'INC', 'CLR']:
+            reg = int(parts[1])
+            if reg not in register_map:
+                register_map[reg] = next_register
+                next_register += 1
+            
+            if opcode == 'IF':
+                # IF <reg> <line>
+                normalized.append(f"{opcode} {register_map[reg]} {parts[2]}")
+            else:
+                # DEC/INC/CLR <reg>
+                normalized.append(f"{opcode} {register_map[reg]}")
+                
+        elif opcode == 'COPY':
+            # COPY <src> <dst>
+            src = int(parts[1])
+            dst = int(parts[2])
+            
+            if src not in register_map:
+                register_map[src] = next_register
+                next_register += 1
+            if dst not in register_map:
+                register_map[dst] = next_register
+                next_register += 1
+                
+            normalized.append(f"{opcode} {register_map[src]} {register_map[dst]}")
+            
+        elif opcode == 'GOTO':
+            # GOTO <line> - no register references
+            normalized.append(instruction)
+    
+    return tuple(normalized)
+
 def generate_all_programs(num_instructions, max_register):
     total_lines = num_instructions + 1  # +1 for HALT
     
@@ -88,11 +135,13 @@ def generate_all_programs(num_instructions, max_register):
         total_programs *= len(pos_instructions)
     
     print(f"Total programs to test: {total_programs:,}")
-    print(f"Applying optimizations to filter out unreachable HALT programs...")
+    print(f"Applying optimizations...")
     
-    # Yield each program, but skip those where HALT is unreachable
+    # Track seen normalized programs to avoid duplicates
+    seen_programs = set()
     programs_generated = 0
-    programs_skipped = 0
+    programs_skipped_unreachable = 0
+    programs_skipped_duplicate = 0
     
     for program_tuple in itertools.product(*all_position_instructions):
         program = list(program_tuple)
@@ -100,13 +149,23 @@ def generate_all_programs(num_instructions, max_register):
         
         # Skip if HALT is unreachable
         if not is_halt_reachable(program):
-            programs_skipped += 1
+            programs_skipped_unreachable += 1
             continue
         
+        # Skip if this is a duplicate (normalized form already seen)
+        normalized = normalize_program(program, max_register)
+        if normalized in seen_programs:
+            programs_skipped_duplicate += 1
+            continue
+        
+        seen_programs.add(normalized)
         programs_generated += 1
         yield program
     
-    print(f"Programs after optimization: {programs_generated:,} (skipped {programs_skipped:,} with unreachable HALT)\n")
+    print(f"Programs after optimization: {programs_generated:,}")
+    print(f"  - Skipped {programs_skipped_unreachable:,} with unreachable HALT")
+    print(f"  - Skipped {programs_skipped_duplicate:,} duplicate/symmetric programs")
+    print()
 
 def create_empty_registers(filepath):
     with open(filepath, 'w') as f:
