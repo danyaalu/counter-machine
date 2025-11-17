@@ -168,9 +168,80 @@ RegFile load_registers(const char *filename)
     return regFile;
 }
 
+// Helper function to print instruction name
+const char *op_to_string(Op op)
+{
+    switch (op)
+    {
+    case OP_IF:
+        return "IF";
+    case OP_DEC:
+        return "DEC";
+    case OP_INC:
+        return "INC";
+    case OP_COPY:
+        return "COPY";
+    case OP_GOTO:
+        return "GOTO";
+    case OP_CLR:
+        return "CLR";
+    case OP_HALT:
+        return "HALT";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+// Helper function to print register values
+void print_registers(const RegFile *register_file)
+{
+    printf("  Registers: ");
+    if (register_file->size == 0)
+    {
+        printf("(empty)\n");
+        return;
+    }
+    for (size_t i = 0; i < register_file->size; i++)
+    {
+        printf("R%zu=%llu", i + 1, (unsigned long long)register_file->r[i]);
+        if (i < register_file->size - 1)
+            printf(", ");
+    }
+    printf("\n");
+}
+
+// Helper function to print instruction details
+void print_instruction(const Instr *instr, size_t pc)
+{
+    printf("  PC=%zu: %s", pc + 1, op_to_string(instr->op));
+    
+    switch (instr->op)
+    {
+    case OP_IF:
+        printf(" R%d (jump to %d if zero)", instr->a + 1, instr->b + 1);
+        break;
+    case OP_DEC:
+    case OP_INC:
+    case OP_CLR:
+        printf(" R%d", instr->a + 1);
+        break;
+    case OP_COPY:
+        printf(" R%d R%d (copy R%d to R%d)", instr->a + 1, instr->b + 1, instr->a + 1, instr->b + 1);
+        break;
+    case OP_GOTO:
+        printf(" %d", instr->a + 1);
+        break;
+    case OP_HALT:
+        // no arguments
+        break;
+    }
+    printf("\n");
+}
+
 void run_program(const Instr *instruction_list,
                  size_t instruction_count,
-                 RegFile *register_file)
+                 RegFile *register_file,
+                 int debug_mode)
 {
     size_t program_counter = 0; // which instruction we are executing
     uint64_t step_count = 0;    // number of executed steps (for debugging)
@@ -180,6 +251,19 @@ void run_program(const Instr *instruction_list,
     {
         Instr current_instruction = instruction_list[program_counter];
         step_count++;
+
+        // Debug mode: print current state before executing
+        if (debug_mode)
+        {
+            printf("%llu [", (unsigned long long)step_count);
+            for (size_t i = 0; i < register_file->size; i++)
+            {
+                printf("%llu", (unsigned long long)register_file->r[i]);
+                if (i < register_file->size - 1)
+                    printf(", ");
+            }
+            printf("]\n");
+        }
 
         switch (current_instruction.op)
         {
@@ -265,16 +349,25 @@ void run_program(const Instr *instruction_list,
     printf("\nProgram terminated because PC went out of range.\n");
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+    // Check for debug flag
+    int debug_mode = 0;
+    if (argc > 1 && strcmp(argv[1], "-d") == 0)
+    {
+        debug_mode = 1;
+        printf("Debug mode enabled.\n");
+    }
+
     size_t program_length;
     Instr *program = load_program("program.txt", &program_length);
     RegFile regFile = load_registers("registers.txt");
 
     // Run program
-    run_program(program, program_length, &regFile);
+    run_program(program, program_length, &regFile, debug_mode);
 
     // Print final registers
+    printf("\nFinal register values:\n");
     for (size_t i = 0; i < regFile.size; i++)
         printf("R%zu = %llu\n", i + 1, (unsigned long long)regFile.r[i]);
 
