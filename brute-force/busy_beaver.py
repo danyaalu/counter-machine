@@ -47,6 +47,27 @@ def generate_instruction(opcode, line_num, max_register, total_lines):
     
     return instructions
 
+def is_halt_reachable(program):
+    if len(program) < 2:  # Need at least one instruction before HALT
+        return True
+    
+    # Get the last instruction before HALT
+    last_instruction = program[-2] if program[-1] == 'HALT' else program[-1]
+    
+    # Parse the instruction
+    parts = last_instruction.split()
+    opcode = parts[0]
+    
+    # GOTO always jumps, so check if it jumps away from HALT
+    if opcode == 'GOTO':
+        jump_target = int(parts[1])
+        halt_line = len(program)  # HALT is at position len(program)
+        # If GOTO jumps to anywhere except HALT line, HALT is unreachable
+        if jump_target != halt_line:
+            return False
+    
+    return True
+
 def generate_all_programs(num_instructions, max_register):
     total_lines = num_instructions + 1  # +1 for HALT
     
@@ -67,13 +88,25 @@ def generate_all_programs(num_instructions, max_register):
         total_programs *= len(pos_instructions)
     
     print(f"Total programs to test: {total_programs:,}")
-    print(f"This might take a while...\n")
+    print(f"Applying optimizations to filter out unreachable HALT programs...")
     
-    # Yield each program
+    # Yield each program, but skip those where HALT is unreachable
+    programs_generated = 0
+    programs_skipped = 0
+    
     for program_tuple in itertools.product(*all_position_instructions):
         program = list(program_tuple)
         program.append('HALT')  # Always add HALT as the final instruction
+        
+        # Skip if HALT is unreachable
+        if not is_halt_reachable(program):
+            programs_skipped += 1
+            continue
+        
+        programs_generated += 1
         yield program
+    
+    print(f"Programs after optimization: {programs_generated:,} (skipped {programs_skipped:,} with unreachable HALT)\n")
 
 def create_empty_registers(filepath):
     with open(filepath, 'w') as f:
