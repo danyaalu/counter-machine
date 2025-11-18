@@ -235,7 +235,7 @@ def normalize_program(program, max_register):
     
     return tuple(normalized)
 
-def generate_all_programs(num_instructions, max_register):
+def generate_all_programs(num_instructions, max_register, use_optimization=True):
     total_lines = num_instructions + 1  # +1 for HALT
     
     # Generate all possible instructions for each position
@@ -255,7 +255,11 @@ def generate_all_programs(num_instructions, max_register):
         total_programs *= len(pos_instructions)
     
     print(f"Total programs to test: {total_programs:,}")
-    print(f"Applying optimizations...")
+    
+    if use_optimization:
+        print(f"Applying optimizations...")
+    else:
+        print(f"Optimizations DISABLED - testing all programs...")
     
     # Track seen normalized programs to avoid duplicates
     seen_programs = set()
@@ -268,37 +272,42 @@ def generate_all_programs(num_instructions, max_register):
         program = list(program_tuple)
         program.append('HALT')  # Always add HALT as the final instruction
         
-        # Skip if HALT is unreachable
-        if not is_halt_reachable(program):
-            programs_skipped_unreachable += 1
-            continue
+        if use_optimization:
+            # Skip if HALT is unreachable
+            if not is_halt_reachable(program):
+                programs_skipped_unreachable += 1
+                continue
+            
+            # Skip if program has obvious infinite loop
+            if has_obvious_infinite_loop(program):
+                programs_skipped_infinite += 1
+                continue
+            
+            # Skip if this is a duplicate (normalized form already seen)
+            normalized = normalize_program(program, max_register)
+            if normalized in seen_programs:
+                programs_skipped_duplicate += 1
+                continue
+            
+            seen_programs.add(normalized)
         
-        # Skip if program has obvious infinite loop
-        if has_obvious_infinite_loop(program):
-            programs_skipped_infinite += 1
-            continue
-        
-        # Skip if this is a duplicate (normalized form already seen)
-        normalized = normalize_program(program, max_register)
-        if normalized in seen_programs:
-            programs_skipped_duplicate += 1
-            continue
-        
-        seen_programs.add(normalized)
         programs_generated += 1
         yield program
     
-    print(f"Programs after optimization: {programs_generated:,}")
-    print(f"  - Skipped {programs_skipped_unreachable:,} with unreachable HALT")
-    print(f"  - Skipped {programs_skipped_infinite:,} with obvious infinite loops")
-    print(f"  - Skipped {programs_skipped_duplicate:,} duplicate/symmetric programs")
+    if use_optimization:
+        print(f"Programs after optimization: {programs_generated:,}")
+        print(f"  - Skipped {programs_skipped_unreachable:,} with unreachable HALT")
+        print(f"  - Skipped {programs_skipped_infinite:,} with obvious infinite loops")
+        print(f"  - Skipped {programs_skipped_duplicate:,} duplicate/symmetric programs")
+    else:
+        print(f"Programs to test (no optimization): {programs_generated:,}")
     print()
 
 def create_empty_registers(filepath):
     with open(filepath, 'w') as f:
         f.write('0\n')
 
-def run_program(program, timeout_seconds, counter_machine_path, work_dir):
+def run_program(program, counter_machine_path, work_dir, max_steps=1000000):
     program_file = work_dir / 'program.txt'
     registers_file = work_dir / 'registers.txt'
     
@@ -310,13 +319,12 @@ def run_program(program, timeout_seconds, counter_machine_path, work_dir):
     create_empty_registers(registers_file)
     
     try:
-        # Run the counter machine with timeout
+        # Run the counter machine with step limit (no timeout)
         result = subprocess.run(
-            [counter_machine_path],
+            [str(counter_machine_path), '-s', str(max_steps)],
             cwd=work_dir,
             capture_output=True,
-            text=True,
-            timeout=timeout_seconds
+            text=True
         )
     
         # Parse output for step count
@@ -327,6 +335,9 @@ def run_program(program, timeout_seconds, counter_machine_path, work_dir):
             parts = output.split("Program halted after")[1].split("steps")[0].strip()
             steps = int(parts)
             return steps, False, None
+        elif "Program exceeded maximum step limit" in output:
+            # Program hit the step limit - treat as infinite loop
+            return 0, True, "Step limit exceeded"
         elif "Program terminated because PC went out of range" in output:
             # Count this as termination, try to extract step count
             # The program doesn't print steps for out-of-range termination
@@ -334,9 +345,6 @@ def run_program(program, timeout_seconds, counter_machine_path, work_dir):
             return 0, False, "Out of range termination"
         else:
             return 0, False, "Unknown output format"
-    
-    except subprocess.TimeoutExpired:
-        return 0, True, "Timeout"
     
     except Exception as e:
         return 0, False, str(e)
@@ -346,13 +354,13 @@ def run_program_wrapper(args):
     Wrapper function for multiprocessing.
     Creates a unique temporary directory for each worker process.
     """
-    program, timeout_seconds, counter_machine_path, temp_dir_base = args
+    program, counter_machine_path, temp_dir_base, max_steps = args
     
     # Create a unique temporary directory for this process
     work_dir = Path(tempfile.mkdtemp(dir=temp_dir_base, prefix='worker_'))
     
     try:
-        result = run_program(program, timeout_seconds, counter_machine_path, work_dir)
+        result = run_program(program, counter_machine_path, work_dir, max_steps)
         return (program, result)
     finally:
         # Cleanup temporary directory
@@ -369,12 +377,14 @@ def main():
                         help='Number of instructions (excluding HALT)')
     parser.add_argument('--max-register', type=int, default=3,
                         help='Maximum register number to use (default: 3)')
-    parser.add_argument('--timeout', type=float, default=0.5,
-                        help='Timeout in seconds for each program (default: 0.5)')
+    parser.add_argument('--max-steps', type=int, default=100000,
+                        help='Maximum steps before considering infinite loop (default: 100000)')
     parser.add_argument('--counter-machine', type=str, default='../countermachine',
                         help='Path to counter machine executable (default: ../countermachine)')
     parser.add_argument('--workers', type=int, default=cpu_count(),
                         help=f'Number of parallel workers (default: {cpu_count()} - all CPU cores)')
+    parser.add_argument('--no-optimization', action='store_true',
+                        help='Disable all optimizations (test all possible programs)')
     
     args = parser.parse_args()
     
@@ -401,8 +411,9 @@ def main():
     print(f"{'='*70}")
     print(f"Instructions (excluding HALT): {args.num_instructions}")
     print(f"Max register: {args.max_register}")
-    print(f"Timeout per program: {args.timeout} seconds")
+    print(f"Max steps per program: {args.max_steps:,}")
     print(f"Parallel workers: {args.workers}")
+    print(f"Optimizations: {'DISABLED' if args.no_optimization else 'ENABLED'}")
     print(f"Counter machine: {counter_machine_path}")
     print(f"{'='*70}\n")
     
@@ -415,13 +426,14 @@ def main():
     
     # Generate all programs first (needed for parallel processing)
     print("Generating programs...")
-    all_programs = list(generate_all_programs(args.num_instructions, args.max_register))
+    use_optimization = not args.no_optimization
+    all_programs = list(generate_all_programs(args.num_instructions, args.max_register, use_optimization))
     total_programs = len(all_programs)
     print(f"Testing {total_programs:,} programs with {args.workers} workers...\n")
     
     # Prepare arguments for each program
     program_args = [
-        (program, args.timeout, counter_machine_path, temp_dir_base)
+        (program, counter_machine_path, temp_dir_base, args.max_steps)
         for program in all_programs
     ]
     
@@ -429,12 +441,12 @@ def main():
     try:
         with Pool(processes=args.workers) as pool:
             # Use imap_unordered for better performance (results come back as they complete)
-            for program, (steps, timed_out, error) in pool.imap_unordered(
+            for program, (steps, exceeded_limit, error) in pool.imap_unordered(
                 run_program_wrapper, program_args, chunksize=10
             ):
                 programs_tested += 1
                 
-                if timed_out:
+                if exceeded_limit:
                     programs_timed_out += 1
                 elif error and error != "Out of range termination":
                     programs_errored += 1
@@ -454,7 +466,7 @@ def main():
                     percent = (programs_tested / total_programs) * 100
                     print(f"Progress: {programs_tested:,}/{total_programs:,} ({percent:.1f}%) - "
                           f"best: {best_steps:,} steps "
-                          f"(timeouts: {programs_timed_out}, errors: {programs_errored})")
+                          f"(exceeded limit: {programs_timed_out}, errors: {programs_errored})")
     
     except KeyboardInterrupt:
         print("\n\nSearch interrupted by user.")
@@ -467,7 +479,7 @@ def main():
     print(f"SEARCH COMPLETE")
     print(f"{'='*70}")
     print(f"Programs tested: {programs_tested:,}")
-    print(f"Programs timed out: {programs_timed_out:,}")
+    print(f"Programs exceeded step limit: {programs_timed_out:,}")
     print(f"Programs errored: {programs_errored:,}")
     print(f"\nLONGEST RUNNING PROGRAM ({best_steps:,} steps):")
     print(f"{'='*70}")

@@ -39,7 +39,7 @@ void ensure_register(RegFile *regFile, size_t index)
     regFile->r = realloc(regFile->r, new_size * sizeof(uint64_t));
 
     // Set new registers to 0
-    for (size_t i = regFile->r; i < new_size; i++)
+    for (size_t i = regFile->size; i < new_size; i++)
         regFile->r[i] = 0;
 
     regFile->size = new_size;
@@ -241,7 +241,8 @@ void print_instruction(const Instr *instr, size_t pc)
 void run_program(const Instr *instruction_list,
                  size_t instruction_count,
                  RegFile *register_file,
-                 int debug_mode)
+                 int debug_mode,
+                 uint64_t max_steps)
 {
     size_t program_counter = 0; // which instruction we are executing
     uint64_t step_count = 0;    // number of executed steps (for debugging)
@@ -251,6 +252,14 @@ void run_program(const Instr *instruction_list,
     {
         Instr current_instruction = instruction_list[program_counter];
         step_count++;
+        
+        // Check if we've exceeded the step limit
+        if (max_steps > 0 && step_count > max_steps)
+        {
+            printf("\nProgram exceeded maximum step limit (%llu steps).\n",
+                   (unsigned long long)max_steps);
+            return;
+        }
 
         // Debug mode: print current state before executing
         if (debug_mode)
@@ -351,12 +360,23 @@ void run_program(const Instr *instruction_list,
 
 int main(int argc, char *argv[])
 {
-    // Check for debug flag
+    // Check for debug flag and max steps
     int debug_mode = 0;
-    if (argc > 1 && strcmp(argv[1], "-d") == 0)
+    uint64_t max_steps = 0; // 0 means no limit
+    
+    for (int i = 1; i < argc; i++)
     {
-        debug_mode = 1;
-        printf("Debug mode enabled.\n");
+        if (strcmp(argv[i], "-d") == 0)
+        {
+            debug_mode = 1;
+            printf("Debug mode enabled.\n");
+        }
+        else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc)
+        {
+            max_steps = strtoull(argv[i + 1], NULL, 10);
+            printf("Maximum steps: %llu\n", (unsigned long long)max_steps);
+            i++; // Skip the next argument
+        }
     }
 
     size_t program_length;
@@ -364,7 +384,7 @@ int main(int argc, char *argv[])
     RegFile regFile = load_registers("registers.txt");
 
     // Run program
-    run_program(program, program_length, &regFile, debug_mode);
+    run_program(program, program_length, &regFile, debug_mode, max_steps);
 
     // Print final registers
     printf("\nFinal register values:\n");
