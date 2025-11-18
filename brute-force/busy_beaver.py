@@ -5,6 +5,9 @@ import os
 import sys
 import argparse
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
+import tempfile
+import shutil
 
 # Available opcodes (excluding HALT which is always last)
 OPCODES = ['IF', 'DEC', 'INC', 'COPY', 'GOTO', 'CLR']
@@ -214,6 +217,23 @@ def run_program(program, timeout_seconds, counter_machine_path, work_dir):
     except Exception as e:
         return 0, False, str(e)
 
+def run_program_wrapper(args):
+    """
+    Wrapper function for multiprocessing.
+    Creates a unique temporary directory for each worker process.
+    """
+    program, timeout_seconds, counter_machine_path, temp_dir_base = args
+    
+    # Create a unique temporary directory for this process
+    work_dir = Path(tempfile.mkdtemp(dir=temp_dir_base, prefix='worker_'))
+    
+    try:
+        result = run_program(program, timeout_seconds, counter_machine_path, work_dir)
+        return (program, result)
+    finally:
+        # Cleanup temporary directory
+        shutil.rmtree(work_dir, ignore_errors=True)
+
 def format_program(program):
     return '\n'.join(f"{i+1}: {instr}" for i, instr in enumerate(program))
 
@@ -229,6 +249,8 @@ def main():
                         help='Timeout in seconds for each program (default: 0.5)')
     parser.add_argument('--counter-machine', type=str, default='../countermachine',
                         help='Path to counter machine executable (default: ../countermachine)')
+    parser.add_argument('--workers', type=int, default=cpu_count(),
+                        help=f'Number of parallel workers (default: {cpu_count()} - all CPU cores)')
     
     args = parser.parse_args()
     
@@ -246,12 +268,17 @@ def main():
         print("Please compile the counter machine first with: gcc main.c -o countermachine")
         sys.exit(1)
     
+    # Create temporary directory for worker processes
+    temp_dir_base = work_dir / 'temp_work_dirs'
+    temp_dir_base.mkdir(exist_ok=True)
+    
     print(f"{'='*70}")
-    print(f"BUSY BEAVER BRUTE FORCE SEARCH")
+    print(f"BUSY BEAVER BRUTE FORCE SEARCH (PARALLEL)")
     print(f"{'='*70}")
     print(f"Instructions (excluding HALT): {args.num_instructions}")
     print(f"Max register: {args.max_register}")
     print(f"Timeout per program: {args.timeout} seconds")
+    print(f"Parallel workers: {args.workers}")
     print(f"Counter machine: {counter_machine_path}")
     print(f"{'='*70}\n")
     
@@ -262,38 +289,54 @@ def main():
     programs_timed_out = 0
     programs_errored = 0
     
-    # Generate and test all programs
+    # Generate all programs first (needed for parallel processing)
+    print("Generating programs...")
+    all_programs = list(generate_all_programs(args.num_instructions, args.max_register))
+    total_programs = len(all_programs)
+    print(f"Testing {total_programs:,} programs with {args.workers} workers...\n")
+    
+    # Prepare arguments for each program
+    program_args = [
+        (program, args.timeout, counter_machine_path, temp_dir_base)
+        for program in all_programs
+    ]
+    
+    # Run programs in parallel
     try:
-        for program in generate_all_programs(args.num_instructions, args.max_register):
-            programs_tested += 1
-            
-            steps, timed_out, error = run_program(
-                program, args.timeout, counter_machine_path, work_dir
-            )
-            
-            if timed_out:
-                programs_timed_out += 1
-            elif error and error != "Out of range termination":
-                programs_errored += 1
-            
-            # Update best if this program ran longer
-            if steps > best_steps:
-                best_steps = steps
-                best_program = program
-                print(f"\n{'*'*70}")
-                print(f"NEW BEST FOUND! Steps: {best_steps:,}")
-                print(f"{'*'*70}")
-                print(format_program(best_program))
-                print(f"{'*'*70}\n")
-            
-            # Progress update every 100 programs
-            if programs_tested % 100 == 0:
-                print(f"Progress: {programs_tested:,} programs tested, "
-                      f"best so far: {best_steps:,} steps "
-                      f"(timeouts: {programs_timed_out}, errors: {programs_errored})")
+        with Pool(processes=args.workers) as pool:
+            # Use imap_unordered for better performance (results come back as they complete)
+            for program, (steps, timed_out, error) in pool.imap_unordered(
+                run_program_wrapper, program_args, chunksize=10
+            ):
+                programs_tested += 1
+                
+                if timed_out:
+                    programs_timed_out += 1
+                elif error and error != "Out of range termination":
+                    programs_errored += 1
+                
+                # Update best if this program ran longer
+                if steps > best_steps:
+                    best_steps = steps
+                    best_program = program
+                    print(f"\n{'*'*70}")
+                    print(f"NEW BEST FOUND! Steps: {best_steps:,}")
+                    print(f"{'*'*70}")
+                    print(format_program(best_program))
+                    print(f"{'*'*70}\n")
+                
+                # Progress update every 100 programs
+                if programs_tested % 100 == 0:
+                    percent = (programs_tested / total_programs) * 100
+                    print(f"Progress: {programs_tested:,}/{total_programs:,} ({percent:.1f}%) - "
+                          f"best: {best_steps:,} steps "
+                          f"(timeouts: {programs_timed_out}, errors: {programs_errored})")
     
     except KeyboardInterrupt:
         print("\n\nSearch interrupted by user.")
+    finally:
+        # Cleanup temp directory
+        shutil.rmtree(temp_dir_base, ignore_errors=True)
     
     # Final results
     print(f"\n{'='*70}")
