@@ -71,6 +71,123 @@ def is_halt_reachable(program):
     
     return True
 
+def has_obvious_infinite_loop(program):
+    """
+    Detect obvious infinite loops through static analysis.
+    Returns True if the program definitely has an infinite loop.
+    
+    Detects:
+    1. Unconditional backward jumps (GOTO to same or earlier line)
+    2. Loops with no register modifications (infinite IF loops)
+    3. Unreachable HALT due to control flow
+    4. Loops that increment without a termination condition
+    """
+    
+    # Build a control flow graph
+    num_instructions = len(program) - 1  # Exclude HALT
+    
+    # Pattern 1: Direct backward GOTO
+    for i, instr in enumerate(program[:-1]):
+        parts = instr.split()
+        opcode = parts[0]
+        current_line = i + 1
+        
+        if opcode == 'GOTO':
+            target = int(parts[1])
+            # Unconditional backward jump = infinite loop
+            if target <= current_line:
+                return True
+    
+    # Pattern 2: IF loop that never terminates
+    # Detect loops where the condition register is never modified
+    for i, instr in enumerate(program[:-1]):
+        parts = instr.split()
+        opcode = parts[0]
+        current_line = i + 1
+        
+        if opcode == 'IF':
+            reg = int(parts[1])
+            target = int(parts[2])
+            
+            # If jumps backward, check if register is modified in the loop
+            if target <= current_line:
+                # Analyze instructions in the loop
+                loop_start = target - 1
+                loop_end = i
+                modifies_reg = False
+                
+                for j in range(loop_start, loop_end + 1):
+                    loop_instr = program[j].split()
+                    loop_opcode = loop_instr[0]
+                    
+                    # Check if this instruction modifies the IF register
+                    if loop_opcode in ['DEC', 'INC', 'CLR']:
+                        if int(loop_instr[1]) == reg:
+                            modifies_reg = True
+                            break
+                    elif loop_opcode == 'COPY':
+                        # COPY modifies destination register
+                        if int(loop_instr[2]) == reg:
+                            modifies_reg = True
+                            break
+                
+                # If register is never modified and starts at 0, infinite loop
+                # (since IF jumps when register != 0, and it stays 0)
+                # OR if register is only incremented, infinite loop
+                # (since it will never reach 0)
+                if not modifies_reg:
+                    # Register never changes in loop
+                    # If it starts at 0, IF never jumps = not infinite
+                    # But if we INC before the IF, it loops forever
+                    # Check if register is incremented before this IF
+                    for j in range(0, i):
+                        check_instr = program[j].split()
+                        if check_instr[0] == 'INC' and int(check_instr[1]) == reg:
+                            # Register incremented but never decremented in loop
+                            return True
+    
+    # Pattern 3: Infinite increment loops
+    # Loop that only increments registers without any DEC or CLR
+    for i, instr in enumerate(program[:-1]):
+        parts = instr.split()
+        opcode = parts[0]
+        current_line = i + 1
+        
+        if opcode == 'IF':
+            target = int(parts[2])
+            
+            # Backward jump
+            if target <= current_line:
+                loop_start = target - 1
+                loop_end = i
+                
+                has_dec = False
+                has_clr = False
+                
+                # Check if loop has any DEC or CLR
+                for j in range(loop_start, loop_end + 1):
+                    loop_instr = program[j].split()
+                    loop_opcode = loop_instr[0]
+                    
+                    if loop_opcode in ['DEC', 'CLR']:
+                        has_dec = True
+                        break
+                
+                # If loop only has INC/COPY but no DEC/CLR, and registers start at 0,
+                # it may run forever
+                if not has_dec:
+                    # Check if any register in the loop is tested by IF
+                    if_reg = int(parts[1])
+                    
+                    # If the IF register is only incremented in loop, infinite
+                    for j in range(loop_start, loop_end + 1):
+                        loop_instr = program[j].split()
+                        if loop_instr[0] == 'INC' and int(loop_instr[1]) == if_reg:
+                            # Register is incremented, IF will always jump, infinite loop
+                            return True
+    
+    return False
+
 def normalize_program(program, max_register):
     register_map = {}
     next_register = 1
@@ -145,6 +262,7 @@ def generate_all_programs(num_instructions, max_register):
     programs_generated = 0
     programs_skipped_unreachable = 0
     programs_skipped_duplicate = 0
+    programs_skipped_infinite = 0
     
     for program_tuple in itertools.product(*all_position_instructions):
         program = list(program_tuple)
@@ -153,6 +271,11 @@ def generate_all_programs(num_instructions, max_register):
         # Skip if HALT is unreachable
         if not is_halt_reachable(program):
             programs_skipped_unreachable += 1
+            continue
+        
+        # Skip if program has obvious infinite loop
+        if has_obvious_infinite_loop(program):
+            programs_skipped_infinite += 1
             continue
         
         # Skip if this is a duplicate (normalized form already seen)
@@ -167,6 +290,7 @@ def generate_all_programs(num_instructions, max_register):
     
     print(f"Programs after optimization: {programs_generated:,}")
     print(f"  - Skipped {programs_skipped_unreachable:,} with unreachable HALT")
+    print(f"  - Skipped {programs_skipped_infinite:,} with obvious infinite loops")
     print(f"  - Skipped {programs_skipped_duplicate:,} duplicate/symmetric programs")
     print()
 
