@@ -51,6 +51,15 @@ def generate_instruction(opcode, line_num, max_register, total_lines):
     return instructions
 
 def is_halt_reachable(program):
+    """
+    Check if HALT is reachable in the program.
+    
+    VERY conservative - only catches the most obvious case:
+    - The last instruction before HALT is a GOTO that jumps away
+    
+    Note: This doesn't catch all unreachable HALT cases (like complex control flow),
+    but it avoids false positives. Static analysis of reachability is hard!
+    """
     if len(program) < 2:  # Need at least one instruction before HALT
         return True
     
@@ -61,13 +70,24 @@ def is_halt_reachable(program):
     parts = last_instruction.split()
     opcode = parts[0]
     
-    # GOTO always jumps, so check if it jumps away from HALT
+    # Only check if the instruction right before HALT is GOTO
+    # Even then, it might be reachable from earlier in the program
+    # So we only reject if GOTO jumps to itself (creating a 1-instruction loop)
     if opcode == 'GOTO':
         jump_target = int(parts[1])
-        halt_line = len(program)  # HALT is at position len(program)
-        # If GOTO jumps to anywhere except HALT line, HALT is unreachable
-        if jump_target != halt_line:
-            return False
+        goto_line = len(program) - 1  # Line number of this GOTO
+        halt_line = len(program)
+        
+        # Only reject if GOTO jumps to itself (infinite 1-instruction loop)
+        # or jumps to an earlier line (but not HALT)
+        if jump_target == goto_line:
+            return False  # GOTO to itself = infinite loop
+        # If GOTO jumps to HALT, that's fine
+        if jump_target == halt_line:
+            return True
+        # If GOTO jumps forward or backward (but not to itself), 
+        # HALT might still be reachable from other paths
+        # So we'll be conservative and say it's reachable
     
     return True
 
@@ -76,17 +96,18 @@ def has_obvious_infinite_loop(program):
     Detect obvious infinite loops through static analysis.
     Returns True if the program definitely has an infinite loop.
     
-    Detects:
-    1. Unconditional backward jumps (GOTO to same or earlier line)
-    2. Loops with no register modifications (infinite IF loops)
-    3. Unreachable HALT due to control flow
-    4. Loops that increment without a termination condition
+    This is now VERY conservative - only catches the most obvious cases:
+    1. Unconditional backward GOTO (always loops)
+    2. Self-jumping GOTO (GOTO to itself)
+    
+    We avoid catching:
+    - IF loops (they may terminate depending on register values)
+    - Loops with INC/DEC (complex to analyze correctly)
     """
     
-    # Build a control flow graph
     num_instructions = len(program) - 1  # Exclude HALT
     
-    # Pattern 1: Direct backward GOTO
+    # Only catch unconditional backward GOTO
     for i, instr in enumerate(program[:-1]):
         parts = instr.split()
         opcode = parts[0]
@@ -94,98 +115,10 @@ def has_obvious_infinite_loop(program):
         
         if opcode == 'GOTO':
             target = int(parts[1])
-            # Unconditional backward jump = infinite loop
+            # GOTO to same line or earlier = definite infinite loop
             if target <= current_line:
                 return True
-    
-    # Pattern 2: IF loop that never terminates
-    # Detect loops where the condition register is never modified
-    for i, instr in enumerate(program[:-1]):
-        parts = instr.split()
-        opcode = parts[0]
-        current_line = i + 1
-        
-        if opcode == 'IF':
-            reg = int(parts[1])
-            target = int(parts[2])
-            
-            # If jumps backward, check if register is modified in the loop
-            if target <= current_line:
-                # Analyze instructions in the loop
-                loop_start = target - 1
-                loop_end = i
-                modifies_reg = False
-                
-                for j in range(loop_start, loop_end + 1):
-                    loop_instr = program[j].split()
-                    loop_opcode = loop_instr[0]
-                    
-                    # Check if this instruction modifies the IF register
-                    if loop_opcode in ['DEC', 'INC', 'CLR']:
-                        if int(loop_instr[1]) == reg:
-                            modifies_reg = True
-                            break
-                    elif loop_opcode == 'COPY':
-                        # COPY modifies destination register
-                        if int(loop_instr[2]) == reg:
-                            modifies_reg = True
-                            break
-                
-                # If register is never modified and starts at 0, infinite loop
-                # (since IF jumps when register != 0, and it stays 0)
-                # OR if register is only incremented, infinite loop
-                # (since it will never reach 0)
-                if not modifies_reg:
-                    # Register never changes in loop
-                    # If it starts at 0, IF never jumps = not infinite
-                    # But if we INC before the IF, it loops forever
-                    # Check if register is incremented before this IF
-                    for j in range(0, i):
-                        check_instr = program[j].split()
-                        if check_instr[0] == 'INC' and int(check_instr[1]) == reg:
-                            # Register incremented but never decremented in loop
-                            return True
-    
-    # Pattern 3: Infinite increment loops
-    # Loop that only increments registers without any DEC or CLR
-    for i, instr in enumerate(program[:-1]):
-        parts = instr.split()
-        opcode = parts[0]
-        current_line = i + 1
-        
-        if opcode == 'IF':
-            target = int(parts[2])
-            
-            # Backward jump
-            if target <= current_line:
-                loop_start = target - 1
-                loop_end = i
-                
-                has_dec = False
-                has_clr = False
-                
-                # Check if loop has any DEC or CLR
-                for j in range(loop_start, loop_end + 1):
-                    loop_instr = program[j].split()
-                    loop_opcode = loop_instr[0]
-                    
-                    if loop_opcode in ['DEC', 'CLR']:
-                        has_dec = True
-                        break
-                
-                # If loop only has INC/COPY but no DEC/CLR, and registers start at 0,
-                # it may run forever
-                if not has_dec:
-                    # Check if any register in the loop is tested by IF
-                    if_reg = int(parts[1])
-                    
-                    # If the IF register is only incremented in loop, infinite
-                    for j in range(loop_start, loop_end + 1):
-                        loop_instr = program[j].split()
-                        if loop_instr[0] == 'INC' and int(loop_instr[1]) == if_reg:
-                            # Register is incremented, IF will always jump, infinite loop
-                            return True
-    
+
     return False
 
 def normalize_program(program, max_register):
@@ -261,11 +194,8 @@ def generate_all_programs(num_instructions, max_register, use_optimization=True)
     else:
         print(f"Optimizations DISABLED - testing all programs...")
     
-    # Track seen normalized programs to avoid duplicates
-    seen_programs = set()
     programs_generated = 0
     programs_skipped_unreachable = 0
-    programs_skipped_duplicate = 0
     programs_skipped_infinite = 0
     
     for program_tuple in itertools.product(*all_position_instructions):
@@ -282,14 +212,6 @@ def generate_all_programs(num_instructions, max_register, use_optimization=True)
             if has_obvious_infinite_loop(program):
                 programs_skipped_infinite += 1
                 continue
-            
-            # Skip if this is a duplicate (normalized form already seen)
-            normalized = normalize_program(program, max_register)
-            if normalized in seen_programs:
-                programs_skipped_duplicate += 1
-                continue
-            
-            seen_programs.add(normalized)
         
         programs_generated += 1
         yield program
@@ -298,7 +220,6 @@ def generate_all_programs(num_instructions, max_register, use_optimization=True)
         print(f"Programs after optimization: {programs_generated:,}")
         print(f"  - Skipped {programs_skipped_unreachable:,} with unreachable HALT")
         print(f"  - Skipped {programs_skipped_infinite:,} with obvious infinite loops")
-        print(f"  - Skipped {programs_skipped_duplicate:,} duplicate/symmetric programs")
     else:
         print(f"Programs to test (no optimization): {programs_generated:,}")
     print()
@@ -464,12 +385,19 @@ def main():
                 # Progress update every 100 programs
                 if programs_tested % 100 == 0:
                     percent = (programs_tested / total_programs) * 100
-                    print(f"Progress: {programs_tested:,}/{total_programs:,} ({percent:.1f}%) - "
-                          f"best: {best_steps:,} steps "
-                          f"(exceeded limit: {programs_timed_out}, errors: {programs_errored})")
+                    try:
+                        print(f"Progress: {programs_tested:,}/{total_programs:,} ({percent:.1f}%) - "
+                              f"best: {best_steps:,} steps "
+                              f"(exceeded limit: {programs_timed_out}, errors: {programs_errored})")
+                    except BrokenPipeError:
+                        # Silently exit if output pipe is closed (e.g., when piped to head)
+                        sys.exit(0)
     
     except KeyboardInterrupt:
         print("\n\nSearch interrupted by user.")
+    except BrokenPipeError:
+        # Silently exit if output pipe is closed
+        sys.exit(0)
     finally:
         # Cleanup temp directory
         shutil.rmtree(temp_dir_base, ignore_errors=True)
