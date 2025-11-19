@@ -168,7 +168,22 @@ def normalize_program(program, max_register):
     
     return tuple(normalized)
 
-def generate_all_programs(num_instructions, max_register, use_optimization=True):
+def filter_program(program):
+    """
+    Filter function for parallel optimization.
+    Returns (program, should_keep, skip_reason) tuple.
+    """
+    # Skip if HALT is unreachable
+    if not is_halt_reachable(program):
+        return (program, False, 'unreachable')
+    
+    # Skip if program has obvious infinite loop
+    if has_obvious_infinite_loop(program):
+        return (program, False, 'infinite')
+    
+    return (program, True, None)
+
+def generate_all_programs(num_instructions, max_register, use_optimization=True, workers=None):
     total_lines = num_instructions + 1  # +1 for HALT
     
     # Generate all possible instructions for each position
@@ -189,40 +204,63 @@ def generate_all_programs(num_instructions, max_register, use_optimization=True)
     
     print(f"Total programs to test: {total_programs:,}")
     
-    if use_optimization:
-        print(f"Applying optimizations...")
-    else:
-        print(f"Optimizations DISABLED - testing all programs...")
+    if not use_optimization:
+        print(f"Optimizations DISABLED - generating all programs...")
+        all_programs = []
+        for program_tuple in itertools.product(*all_position_instructions):
+            program = list(program_tuple)
+            program.append('HALT')
+            all_programs.append(program)
+        print(f"Programs to test (no optimization): {len(all_programs):,}\n")
+        return all_programs
     
-    programs_generated = 0
+    # Apply optimizations in parallel
+    print(f"Applying optimizations in parallel with {workers or cpu_count()} workers...")
+    
+    # Generate all programs first
+    print("Generating program combinations...")
+    all_programs_raw = []
+    for program_tuple in itertools.product(*all_position_instructions):
+        program = list(program_tuple)
+        program.append('HALT')
+        all_programs_raw.append(program)
+    
+    print(f"Generated {len(all_programs_raw):,} programs, filtering in parallel...")
+    
+    # Filter in parallel
+    programs_kept = []
     programs_skipped_unreachable = 0
     programs_skipped_infinite = 0
     
-    for program_tuple in itertools.product(*all_position_instructions):
-        program = list(program_tuple)
-        program.append('HALT')  # Always add HALT as the final instruction
+    with Pool(processes=workers) as pool:
+        # Use imap_unordered for better performance with progress tracking
+        chunk_size = 1000
+        processed = 0
         
-        if use_optimization:
-            # Skip if HALT is unreachable
-            if not is_halt_reachable(program):
-                programs_skipped_unreachable += 1
-                continue
+        for program, should_keep, skip_reason in pool.imap_unordered(
+            filter_program, all_programs_raw, chunksize=chunk_size
+        ):
+            processed += 1
             
-            # Skip if program has obvious infinite loop
-            if has_obvious_infinite_loop(program):
+            if should_keep:
+                programs_kept.append(program)
+            elif skip_reason == 'unreachable':
+                programs_skipped_unreachable += 1
+            elif skip_reason == 'infinite':
                 programs_skipped_infinite += 1
-                continue
-        
-        programs_generated += 1
-        yield program
+            
+            # Progress update every 50,000 programs
+            if processed % 50000 == 0:
+                percent = (processed / len(all_programs_raw)) * 100
+                print(f"  Filtering progress: {processed:,}/{len(all_programs_raw):,} ({percent:.1f}%) - "
+                      f"kept: {len(programs_kept):,}")
     
-    if use_optimization:
-        print(f"Programs after optimization: {programs_generated:,}")
-        print(f"  - Skipped {programs_skipped_unreachable:,} with unreachable HALT")
-        print(f"  - Skipped {programs_skipped_infinite:,} with obvious infinite loops")
-    else:
-        print(f"Programs to test (no optimization): {programs_generated:,}")
+    print(f"Programs after optimization: {len(programs_kept):,}")
+    print(f"  - Skipped {programs_skipped_unreachable:,} with unreachable HALT")
+    print(f"  - Skipped {programs_skipped_infinite:,} with obvious infinite loops")
     print()
+    
+    return programs_kept
 
 def create_empty_registers(filepath):
     with open(filepath, 'w') as f:
@@ -345,10 +383,14 @@ def main():
     programs_timed_out = 0
     programs_errored = 0
     
-    # Generate all programs first (needed for parallel processing)
-    print("Generating programs...")
+    # Generate and filter all programs (filtering done in parallel)
     use_optimization = not args.no_optimization
-    all_programs = list(generate_all_programs(args.num_instructions, args.max_register, use_optimization))
+    all_programs = generate_all_programs(
+        args.num_instructions, 
+        args.max_register, 
+        use_optimization,
+        workers=args.workers
+    )
     total_programs = len(all_programs)
     print(f"Testing {total_programs:,} programs with {args.workers} workers...\n")
     
