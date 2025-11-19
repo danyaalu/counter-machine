@@ -12,6 +12,44 @@ import shutil
 # Available opcodes (excluding HALT which is always last)
 OPCODES = ['IF', 'DEC', 'INC', 'COPY', 'GOTO', 'CLR']
 
+# Encoding/Decoding functions for memory efficiency
+def encode_instruction(instruction):
+    parts = instruction.split()
+    opcode = parts[0]
+    
+    opcode_map = {'IF': 0, 'DEC': 1, 'INC': 2, 'COPY': 3, 'GOTO': 4, 'CLR': 5, 'HALT': 6}
+    opcode_bits = opcode_map[opcode]
+    
+    arg1 = int(parts[1]) if len(parts) > 1 else 0
+    arg2 = int(parts[2]) if len(parts) > 2 else 0
+    
+    # Pack into single integer: opcode | arg1 | arg2
+    return (opcode_bits << 16) | (arg1 << 8) | arg2
+
+def decode_instruction(encoded):
+    opcode_map = ['IF', 'DEC', 'INC', 'COPY', 'GOTO', 'CLR', 'HALT']
+    
+    opcode_bits = (encoded >> 16) & 0x7
+    arg1 = (encoded >> 8) & 0xFF
+    arg2 = encoded & 0xFF
+    
+    opcode = opcode_map[opcode_bits]
+    
+    if opcode == 'HALT':
+        return 'HALT'
+    elif opcode in ['IF', 'COPY']:
+        return f"{opcode} {arg1} {arg2}"
+    elif opcode in ['DEC', 'INC', 'CLR']:
+        return f"{opcode} {arg1}"
+    elif opcode == 'GOTO':
+        return f"{opcode} {arg1}"
+
+def encode_program(program):
+    return tuple(encode_instruction(instr) for instr in program)
+
+def decode_program(encoded_program):
+    return [decode_instruction(enc) for enc in encoded_program]
+
 def generate_instruction(opcode, line_num, max_register, total_lines):
     instructions = []
     
@@ -168,20 +206,23 @@ def normalize_program(program, max_register):
     
     return tuple(normalized)
 
-def filter_program(program):
+def filter_program(encoded_program):
     """
     Filter function for parallel optimization.
-    Returns (program, should_keep, skip_reason) tuple.
+    Returns (encoded_program, should_keep, skip_reason) tuple.
     """
+    # Decode for filtering
+    program = decode_program(encoded_program)
+    
     # Skip if HALT is unreachable
     if not is_halt_reachable(program):
-        return (program, False, 'unreachable')
+        return (encoded_program, False, 'unreachable')
     
     # Skip if program has obvious infinite loop
     if has_obvious_infinite_loop(program):
-        return (program, False, 'infinite')
+        return (encoded_program, False, 'infinite')
     
-    return (program, True, None)
+    return (encoded_program, True, None)
 
 def generate_all_programs(num_instructions, max_register, use_optimization=True, workers=None):
     total_lines = num_instructions + 1  # +1 for HALT
@@ -210,7 +251,9 @@ def generate_all_programs(num_instructions, max_register, use_optimization=True,
         for program_tuple in itertools.product(*all_position_instructions):
             program = list(program_tuple)
             program.append('HALT')
-            all_programs.append(program)
+            # Encode before storing
+            encoded = encode_program(program)
+            all_programs.append(encoded)
         print(f"Programs to test (no optimization): {len(all_programs):,}\n")
         return all_programs
     
@@ -223,7 +266,9 @@ def generate_all_programs(num_instructions, max_register, use_optimization=True,
     for program_tuple in itertools.product(*all_position_instructions):
         program = list(program_tuple)
         program.append('HALT')
-        all_programs_raw.append(program)
+        # Encode before storing
+        encoded = encode_program(program)
+        all_programs_raw.append(encoded)
     
     print(f"Generated {len(all_programs_raw):,} programs, filtering in parallel...")
     
@@ -237,13 +282,13 @@ def generate_all_programs(num_instructions, max_register, use_optimization=True,
         chunk_size = 1000
         processed = 0
         
-        for program, should_keep, skip_reason in pool.imap_unordered(
+        for encoded_program, should_keep, skip_reason in pool.imap_unordered(
             filter_program, all_programs_raw, chunksize=chunk_size
         ):
             processed += 1
             
             if should_keep:
-                programs_kept.append(program)
+                programs_kept.append(encoded_program)
             elif skip_reason == 'unreachable':
                 programs_skipped_unreachable += 1
             elif skip_reason == 'infinite':
@@ -266,9 +311,12 @@ def create_empty_registers(filepath):
     with open(filepath, 'w') as f:
         f.write('0\n')
 
-def run_program(program, counter_machine_path, work_dir, max_steps=1000000):
+def run_program(encoded_program, counter_machine_path, work_dir, max_steps=1000000):
     program_file = work_dir / 'program.txt'
     registers_file = work_dir / 'registers.txt'
+    
+    # Decode program before writing to file
+    program = decode_program(encoded_program)
     
     # Write program to file
     with open(program_file, 'w') as f:
@@ -325,7 +373,8 @@ def run_program_wrapper(args):
         # Cleanup temporary directory
         shutil.rmtree(work_dir, ignore_errors=True)
 
-def format_program(program):
+def format_program(encoded_program):
+    program = decode_program(encoded_program)
     return '\n'.join(f"{i+1}: {instr}" for i, instr in enumerate(program))
 
 def main():
