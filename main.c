@@ -238,10 +238,11 @@ void print_instruction(const Instr *instr, size_t pc)
     printf("\n");
 }
 
-void run_program(const Instr *instruction_list,
+int run_program(const Instr *instruction_list,
                  size_t instruction_count,
                  RegFile *register_file,
                  int debug_mode,
+                 int server_mode,
                  uint64_t max_steps)
 {
     size_t program_counter = 0; // which instruction we are executing
@@ -256,9 +257,22 @@ void run_program(const Instr *instruction_list,
         // Check if we've exceeded the step limit
         if (max_steps > 0 && step_count > max_steps)
         {
-            printf("\nProgram exceeded maximum step limit (%llu steps).\n",
-                   (unsigned long long)max_steps);
-            return;
+            if (server_mode)
+            {
+                // Server mode: output -1 to indicate exceeded limit
+                printf("-1\n");
+            }
+            else if (debug_mode)
+            {
+                printf("\nProgram exceeded maximum step limit (%llu steps).\n",
+                       (unsigned long long)max_steps);
+            }
+            else
+            {
+                printf("Program exceeded maximum step limit (%llu steps).\n",
+                       (unsigned long long)max_steps);
+            }
+            return 0; // Return 0 to indicate exceeded limit
         }
 
         // Debug mode: print current state before executing
@@ -348,20 +362,151 @@ void run_program(const Instr *instruction_list,
 
         case OP_HALT:
         {
-            printf("\nProgram halted after %llu steps.\n",
-                   (unsigned long long)step_count);
-            return;
+            if (server_mode)
+            {
+                // Server mode: just output step count (positive number)
+                printf("%llu\n", (unsigned long long)step_count);
+            }
+            else if (debug_mode)
+            {
+                printf("\nProgram halted after %llu steps.\n",
+                       (unsigned long long)step_count);
+            }
+            else
+            {
+                printf("Program halted after %llu steps.\n",
+                       (unsigned long long)step_count);
+            }
+            return (int)step_count;
         }
         }
     }
 
-    printf("\nProgram terminated because PC went out of range.\n");
+    if (server_mode)
+    {
+        // Server mode: output -2 to indicate out of range
+        printf("-2\n");
+    }
+    else if (debug_mode)
+    {
+        printf("\nProgram terminated because PC went out of range.\n");
+    }
+    else
+    {
+        printf("Program terminated because PC went out of range.\n");
+    }
+    return -1; // Return -1 to indicate out of range
+}
+
+// Server mode: continuously read and execute programs
+// Protocol:
+//   Input: <num_instructions>\n<instruction1>\n<instruction2>\n...\nEND\n
+//   Output: Single integer:
+//     > 0: Program halted successfully after N steps
+//     -1: Program exceeded step limit
+//     -2: Program went out of range
+void run_server_mode(uint64_t max_steps)
+{
+    char line[256];
+    
+    while (1)
+    {
+        // Read number of instructions
+        if (!fgets(line, sizeof(line), stdin))
+        {
+            break; // EOF or error
+        }
+        
+        int num_instructions = atoi(line);
+        if (num_instructions <= 0 || num_instructions > 1000)
+        {
+            fprintf(stderr, "Invalid instruction count: %d\n", num_instructions);
+            continue;
+        }
+        
+        // Allocate instruction array
+        Instr *instruction_list = malloc(num_instructions * sizeof(Instr));
+        if (!instruction_list)
+        {
+            fprintf(stderr, "Memory allocation failed\n");
+            break;
+        }
+        
+        // Read instructions
+        int instruction_count = 0;
+        for (int i = 0; i < num_instructions; i++)
+        {
+            if (!fgets(line, sizeof(line), stdin))
+            {
+                free(instruction_list);
+                return; // EOF
+            }
+            
+            // Check for END marker
+            if (strncmp(line, "END", 3) == 0)
+            {
+                break;
+            }
+            
+            // Parse instruction
+            char opcode_text[32];
+            int arg1 = 0, arg2 = 0;
+            int parsed_fields = sscanf(line, "%31s %d %d", opcode_text, &arg1, &arg2);
+            
+            if (parsed_fields < 1)
+            {
+                continue; // Skip invalid lines
+            }
+            
+            Instr instruction;
+            instruction.op = op_from_string(opcode_text);
+            
+            if (instruction.op == OP_HALT)
+            {
+                instruction.a = 0;
+                instruction.b = 0;
+            }
+            else if (instruction.op == OP_GOTO)
+            {
+                instruction.a = arg1 - 1;
+                instruction.b = 0;
+            }
+            else if (parsed_fields == 3)
+            {
+                instruction.a = arg1 - 1;
+                instruction.b = arg2 - 1;
+            }
+            else if (parsed_fields == 2)
+            {
+                instruction.a = arg1 - 1;
+                instruction.b = 0;
+            }
+            
+            instruction_list[instruction_count++] = instruction;
+        }
+        
+        // Initialize registers (all zeros)
+        RegFile regFile;
+        regFile.r = calloc(16, sizeof(uint64_t)); // Start with 16 registers
+        regFile.size = 16;
+        
+        // Run program in server mode (non-debug, server_mode=1)
+        run_program(instruction_list, instruction_count, &regFile, 0, 1, max_steps);
+        
+        // Flush output
+        fflush(stdout);
+        
+        // Cleanup
+        free(instruction_list);
+        free(regFile.r);
+    }
 }
 
 int main(int argc, char *argv[])
 {
-    // Check for debug flag and max steps
+    // Check for flags
     int debug_mode = 0;
+    int server_mode = 0;
     uint64_t max_steps = 0; // 0 means no limit
     
     for (int i = 1; i < argc; i++)
@@ -371,27 +516,45 @@ int main(int argc, char *argv[])
             debug_mode = 1;
             printf("Debug mode enabled.\n");
         }
+        else if (strcmp(argv[i], "--server") == 0)
+        {
+            server_mode = 1;
+        }
         else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc)
         {
             max_steps = strtoull(argv[i + 1], NULL, 10);
-            printf("Maximum steps: %llu\n", (unsigned long long)max_steps);
+            if (!server_mode)
+            {
+                printf("Maximum steps: %llu\n", (unsigned long long)max_steps);
+            }
             i++; // Skip the next argument
         }
     }
+    
+    // Run in server mode if requested
+    if (server_mode)
+    {
+        run_server_mode(max_steps);
+        return 0;
+    }
 
+    // Normal single-run mode
     size_t program_length;
     Instr *program = load_program("program.txt", &program_length);
     RegFile regFile = load_registers("registers.txt");
 
-    // Run program
-    run_program(program, program_length, &regFile, debug_mode, max_steps);
+    // Run program in normal mode (server_mode=0)
+    int result = run_program(program, program_length, &regFile, debug_mode, 0, max_steps);
 
     // Print final registers
-    printf("\nFinal register values:\n");
-    for (size_t i = 0; i < regFile.size; i++)
-        printf("R%zu = %llu\n", i + 1, (unsigned long long)regFile.r[i]);
+    if (debug_mode)
+    {
+        printf("\nFinal register values:\n");
+        for (size_t i = 0; i < regFile.size; i++)
+            printf("R%zu = %llu\n", i + 1, (unsigned long long)regFile.r[i]);
+    }
 
     free(program);
     free(regFile.r);
-    return 0;
+    return result >= 0 ? 0 : 1;
 }

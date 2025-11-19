@@ -8,9 +8,20 @@ from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import tempfile
 import shutil
+import threading
+import time
+import signal
 
 # Available opcodes (excluding HALT which is always last)
 OPCODES = ['IF', 'DEC', 'INC', 'COPY', 'GOTO', 'CLR']
+
+# Global worker variables - each worker keeps its own server process
+_worker_counter_machine = None
+_worker_work_dir = None
+_worker_max_steps = None
+_worker_server_process = None
+_worker_programs_run = 0
+_worker_restart_interval = 5000  # Restart server after this many programs to prevent hangs
 
 # Encoding/Decoding functions for memory efficiency
 def encode_instruction(instruction):
@@ -311,6 +322,172 @@ def create_empty_registers(filepath):
     with open(filepath, 'w') as f:
         f.write('0\n')
 
+def init_worker_pool(counter_machine_path, temp_dir_base, max_steps):
+    """
+    Initialize each worker with persistent server process.
+    Each worker starts a counter machine in server mode and communicates via stdin/stdout.
+    """
+    global _worker_counter_machine, _worker_work_dir, _worker_max_steps, _worker_server_process, _worker_programs_run
+    
+    _worker_counter_machine = counter_machine_path
+    _worker_max_steps = max_steps
+    _worker_programs_run = 0
+    
+    # Each worker gets its own persistent work directory
+    _worker_work_dir = Path(tempfile.mkdtemp(dir=temp_dir_base, prefix='worker_'))
+    
+    # Start the server process
+    _start_server_process()
+
+def _start_server_process():
+    """Start or restart the server process"""
+    global _worker_server_process, _worker_programs_run
+    
+    # Kill existing process if any
+    if _worker_server_process is not None:
+        try:
+            _worker_server_process.kill()
+            _worker_server_process.wait(timeout=1)
+        except:
+            pass
+    
+    # Start new server process
+    _worker_server_process = subprocess.Popen(
+        [str(_worker_counter_machine), '--server', '-s', str(_worker_max_steps)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,  # Line buffered
+        cwd=_worker_work_dir
+    )
+    _worker_programs_run = 0
+
+def run_program_server(encoded_program):
+    """
+    Run program using the worker's persistent server process.
+    Periodically restarts server to prevent hangs.
+    """
+    global _worker_programs_run
+    
+    # Restart server periodically to prevent hangs
+    if _worker_programs_run >= _worker_restart_interval:
+        try:
+            _start_server_process()
+        except Exception as e:
+            return (encoded_program, (0, False, f"Server restart failed: {e}"))
+    
+    program = decode_program(encoded_program)
+    
+    try:
+        # Write program to server with timeout
+        result = _send_program_to_server(program)
+        _worker_programs_run += 1
+        return (encoded_program, result)
+    
+    except Exception as e:
+        # If anything goes wrong, restart server and try once more
+        try:
+            _start_server_process()
+            result = _send_program_to_server(program)
+            _worker_programs_run += 1
+            return (encoded_program, result)
+        except Exception as e2:
+            return (encoded_program, (0, False, f"Server error: {e2}"))
+
+def _send_program_to_server(program, timeout=5.0):
+    """
+    Send a program to the server and get result with timeout.
+    Returns: (steps, exceeded_limit, error)
+    """
+    global _worker_server_process
+    
+    # Check if server is still alive
+    if _worker_server_process.poll() is not None:
+        raise Exception("Server process died")
+    
+    # Prepare program data
+    program_data = f"{len(program)}\n"
+    for instr in program:
+        program_data += f"{instr}\n"
+    program_data += "END\n"
+    
+    # Use threading to implement timeout
+    result_container = [None]
+    error_container = [None]
+    
+    def write_and_read():
+        try:
+            # Write program
+            _worker_server_process.stdin.write(program_data)
+            _worker_server_process.stdin.flush()
+            
+            # Read result
+            output_line = _worker_server_process.stdout.readline()
+            if not output_line:
+                error_container[0] = "No output from server"
+                return
+            
+            result_container[0] = output_line.strip()
+        except Exception as e:
+            error_container[0] = str(e)
+    
+    # Run with timeout
+    thread = threading.Thread(target=write_and_read)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+    
+    if thread.is_alive():
+        # Timeout - kill the server process
+        try:
+            _worker_server_process.kill()
+        except:
+            pass
+        raise Exception(f"Server timeout after {timeout}s")
+    
+    if error_container[0]:
+        raise Exception(error_container[0])
+    
+    if result_container[0] is None:
+        raise Exception("No result received")
+    
+    # Parse numeric result
+    try:
+        result_value = int(result_container[0])
+        
+        if result_value > 0:
+            # Halted successfully
+            return (result_value, False, None)
+        elif result_value == -1:
+            # Exceeded step limit
+            return (0, True, "Step limit exceeded")
+        elif result_value == -2:
+            # Out of range
+            return (0, False, "Out of range termination")
+        else:
+            return (0, False, f"Unknown result code: {result_value}")
+    
+    except ValueError:
+        return (0, False, f"Invalid output: {result_container[0]}")
+
+
+def cleanup_worker():
+    """Cleanup worker resources on exit"""
+    global _worker_work_dir, _worker_server_process
+    
+    # Kill server process
+    if _worker_server_process is not None:
+        try:
+            _worker_server_process.kill()
+            _worker_server_process.wait(timeout=1)
+        except:
+            pass
+    
+    # Remove work directory
+    if _worker_work_dir and _worker_work_dir.exists():
+        shutil.rmtree(_worker_work_dir, ignore_errors=True)
+
 def run_program(encoded_program, counter_machine_path, work_dir, max_steps=1000000):
     program_file = work_dir / 'program.txt'
     registers_file = work_dir / 'registers.txt'
@@ -337,15 +514,15 @@ def run_program(encoded_program, counter_machine_path, work_dir, max_steps=10000
         # Parse output for step count
         output = result.stdout
         
-        # Look for "Program halted after X steps"
-        if "Program halted after" in output:
-            parts = output.split("Program halted after")[1].split("steps")[0].strip()
+        # Look for "Program halted after X steps" or "RESULT: halted after X steps"
+        if "halted after" in output:
+            parts = output.split("halted after")[1].split("steps")[0].strip()
             steps = int(parts)
             return steps, False, None
-        elif "Program exceeded maximum step limit" in output:
+        elif "exceeded limit" in output:
             # Program hit the step limit - treat as infinite loop
             return 0, True, "Step limit exceeded"
-        elif "Program terminated because PC went out of range" in output:
+        elif "out of range" in output:
             # Count this as termination, try to extract step count
             # The program doesn't print steps for out-of-range termination
             # We'll treat this as 0 or minimal steps
@@ -415,12 +592,13 @@ def main():
     temp_dir_base.mkdir(exist_ok=True)
     
     print(f"{'='*70}")
-    print(f"BUSY BEAVER BRUTE FORCE SEARCH (PARALLEL)")
+    print(f"BUSY BEAVER BRUTE FORCE SEARCH (SERVER MODE)")
     print(f"{'='*70}")
     print(f"Instructions (excluding HALT): {args.num_instructions}")
     print(f"Max register: {args.max_register}")
     print(f"Max steps per program: {args.max_steps:,}")
     print(f"Parallel workers: {args.workers}")
+    print(f"Server restart interval: {_worker_restart_interval:,} programs")
     print(f"Optimizations: {'DISABLED' if args.no_optimization else 'ENABLED'}")
     print(f"Counter machine: {counter_machine_path}")
     print(f"{'='*70}\n")
@@ -430,6 +608,7 @@ def main():
     best_steps = 0
     programs_tested = 0
     programs_timed_out = 0
+    programs_out_of_range = 0
     programs_errored = 0
     
     # Generate and filter all programs (filtering done in parallel)
@@ -443,24 +622,27 @@ def main():
     total_programs = len(all_programs)
     print(f"Testing {total_programs:,} programs with {args.workers} workers...\n")
     
-    # Prepare arguments for each program
-    program_args = [
-        (program, counter_machine_path, temp_dir_base, args.max_steps)
-        for program in all_programs
-    ]
-    
-    # Run programs in parallel
+    # Run programs in parallel with worker reuse
     try:
-        with Pool(processes=args.workers) as pool:
+        with Pool(
+            processes=args.workers,
+            initializer=init_worker_pool,
+            initargs=(counter_machine_path, temp_dir_base, args.max_steps)
+        ) as pool:
+            # Use larger chunksize since workers reuse directories
+            optimal_chunk = max(50, min(200, total_programs // (args.workers * 10)))
+            
             # Use imap_unordered for better performance (results come back as they complete)
             for program, (steps, exceeded_limit, error) in pool.imap_unordered(
-                run_program_wrapper, program_args, chunksize=10
+                run_program_server, all_programs, chunksize=optimal_chunk
             ):
                 programs_tested += 1
                 
                 if exceeded_limit:
                     programs_timed_out += 1
-                elif error and error != "Out of range termination":
+                elif error == "Out of range termination":
+                    programs_out_of_range += 1
+                elif error:
                     programs_errored += 1
                 
                 # Update best if this program ran longer
@@ -479,7 +661,7 @@ def main():
                     try:
                         print(f"Progress: {programs_tested:,}/{total_programs:,} ({percent:.1f}%) - "
                               f"best: {best_steps:,} steps "
-                              f"(exceeded limit: {programs_timed_out}, errors: {programs_errored})")
+                              f"(exceeded: {programs_timed_out}, out-of-range: {programs_out_of_range}, errors: {programs_errored})")
                     except BrokenPipeError:
                         # Silently exit if output pipe is closed (e.g., when piped to head)
                         sys.exit(0)
@@ -499,7 +681,8 @@ def main():
     print(f"{'='*70}")
     print(f"Programs tested: {programs_tested:,}")
     print(f"Programs exceeded step limit: {programs_timed_out:,}")
-    print(f"Programs errored: {programs_errored:,}")
+    print(f"Programs went out of range: {programs_out_of_range:,}")
+    print(f"Programs with errors: {programs_errored:,}")
     print(f"\nLONGEST RUNNING PROGRAM ({best_steps:,} steps):")
     print(f"{'='*70}")
     if best_program:
