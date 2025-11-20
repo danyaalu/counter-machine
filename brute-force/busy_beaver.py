@@ -11,6 +11,7 @@ import shutil
 import threading
 import time
 import signal
+import random
 
 # Available opcodes (excluding HALT which is always last)
 OPCODES = ['IF', 'DEC', 'INC', 'COPY', 'GOTO', 'CLR']
@@ -21,7 +22,8 @@ _worker_work_dir = None
 _worker_max_steps = None
 _worker_server_process = None
 _worker_programs_run = 0
-_worker_restart_interval = 5000  # Restart server after this many programs to prevent hangs
+_worker_restart_interval = 5000  # Base restart interval
+_worker_restart_threshold = None  # Actual threshold with jitter (set per worker)
 
 # Encoding/Decoding functions for memory efficiency
 def encode_instruction(instruction):
@@ -327,11 +329,15 @@ def init_worker_pool(counter_machine_path, temp_dir_base, max_steps):
     Initialize each worker with persistent server process.
     Each worker starts a counter machine in server mode and communicates via stdin/stdout.
     """
-    global _worker_counter_machine, _worker_work_dir, _worker_max_steps, _worker_server_process, _worker_programs_run
+    global _worker_counter_machine, _worker_work_dir, _worker_max_steps, _worker_server_process, _worker_programs_run, _worker_restart_threshold
     
     _worker_counter_machine = counter_machine_path
     _worker_max_steps = max_steps
     _worker_programs_run = 0
+    
+    # Add jitter to restart interval (±20%) to prevent all workers restarting at once
+    jitter = random.uniform(0.8, 1.2)
+    _worker_restart_threshold = int(_worker_restart_interval * jitter)
     
     # Each worker gets its own persistent work directory
     _worker_work_dir = Path(tempfile.mkdtemp(dir=temp_dir_base, prefix='worker_'))
@@ -341,7 +347,7 @@ def init_worker_pool(counter_machine_path, temp_dir_base, max_steps):
 
 def _start_server_process():
     """Start or restart the server process"""
-    global _worker_server_process, _worker_programs_run
+    global _worker_server_process, _worker_programs_run, _worker_restart_threshold
     
     # Kill existing process if any
     if _worker_server_process is not None:
@@ -362,16 +368,20 @@ def _start_server_process():
         cwd=_worker_work_dir
     )
     _worker_programs_run = 0
+    
+    # Reset threshold with new jitter for next restart
+    jitter = random.uniform(0.8, 1.2)
+    _worker_restart_threshold = int(_worker_restart_interval * jitter)
 
 def run_program_server(encoded_program):
     """
     Run program using the worker's persistent server process.
-    Periodically restarts server to prevent hangs.
+    Periodically restarts server to prevent hangs (with jitter to avoid synchronized restarts).
     """
     global _worker_programs_run
     
-    # Restart server periodically to prevent hangs
-    if _worker_programs_run >= _worker_restart_interval:
+    # Restart server periodically to prevent hangs (using jittered threshold)
+    if _worker_programs_run >= _worker_restart_threshold:
         try:
             _start_server_process()
         except Exception as e:
@@ -598,7 +608,7 @@ def main():
     print(f"Max register: {args.max_register}")
     print(f"Max steps per program: {args.max_steps:,}")
     print(f"Parallel workers: {args.workers}")
-    print(f"Server restart interval: {_worker_restart_interval:,} programs")
+    print(f"Server restart interval: ~{_worker_restart_interval:,} programs (with jitter)")
     print(f"Optimizations: {'DISABLED' if args.no_optimization else 'ENABLED'}")
     print(f"Counter machine: {counter_machine_path}")
     print(f"{'='*70}\n")
