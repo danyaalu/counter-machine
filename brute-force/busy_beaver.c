@@ -42,12 +42,23 @@ typedef struct {
     char error[256];
 } ExecutionResult;
 
+// Forward declarations
+typedef struct ProgramGenerator ProgramGenerator;
+typedef struct SharedGenerator SharedGenerator;
+
 // Best program tracking (shared across threads)
 typedef struct {
     Program program;
     int steps;
     pthread_mutex_t lock;
 } BestProgram;
+
+// Shared program generator state for multi-threading
+struct SharedGenerator {
+    ProgramGenerator *generator;
+    pthread_mutex_t lock;
+    bool exhausted;
+};
 
 // Worker thread data
 typedef struct {
@@ -57,6 +68,7 @@ typedef struct {
     int max_register;
     int num_instructions;
     BestProgram *best;
+    SharedGenerator *shared_gen;
     
     // Statistics
     unsigned long programs_tested;
@@ -68,6 +80,8 @@ typedef struct {
     pid_t server_pid;
     int stdin_pipe[2];
     int stdout_pipe[2];
+    FILE *stdin_stream;
+    FILE *stdout_stream;
     int programs_since_restart;
     int restart_threshold;
 } WorkerContext;
@@ -292,9 +306,25 @@ bool start_server_process(WorkerContext *ctx) {
     ctx->server_pid = pid;
     ctx->programs_since_restart = 0;
     
+    // Convert file descriptors to FILE* streams for buffering
+    ctx->stdin_stream = fdopen(ctx->stdin_pipe[1], "w");
+    ctx->stdout_stream = fdopen(ctx->stdout_pipe[0], "r");
+    
+    if (!ctx->stdin_stream || !ctx->stdout_stream) {
+        perror("fdopen");
+        return false;
+    }
+    
+    // Set line buffering
+    setvbuf(ctx->stdin_stream, NULL, _IOLBF, 0);
+    setvbuf(ctx->stdout_stream, NULL, _IOLBF, 0);
+    
     // Set new restart threshold with jitter
     double jitter = 0.8 + (rand() / (double)RAND_MAX) * 0.4;  // 0.8 to 1.2
     ctx->restart_threshold = (int)(5000 * jitter);
+    
+    // Give the server a moment to start up
+    usleep(10000);  // 10ms
     
     return true;
 }
@@ -302,10 +332,18 @@ bool start_server_process(WorkerContext *ctx) {
 // Stop server process
 void stop_server_process(WorkerContext *ctx) {
     if (ctx->server_pid > 0) {
+        // Close streams first
+        if (ctx->stdin_stream) {
+            fclose(ctx->stdin_stream);
+            ctx->stdin_stream = NULL;
+        }
+        if (ctx->stdout_stream) {
+            fclose(ctx->stdout_stream);
+            ctx->stdout_stream = NULL;
+        }
+        
         kill(ctx->server_pid, SIGKILL);
         waitpid(ctx->server_pid, NULL, 0);
-        close(ctx->stdin_pipe[1]);
-        close(ctx->stdout_pipe[0]);
         ctx->server_pid = 0;
     }
 }
@@ -324,37 +362,25 @@ ExecutionResult run_program_on_server(WorkerContext *ctx, Program *program) {
     }
     
     // Send program to server
-    char buffer[4096];
-    int offset = 0;
-    
     // Write number of instructions
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%d\n", program->length);
+    fprintf(ctx->stdin_stream, "%d\n", program->length);
     
     // Write each instruction
     for (int i = 0; i < program->length; i++) {
         char instr[64];
         decode_instruction(program->instructions[i], instr, sizeof(instr));
-        offset += snprintf(buffer + offset, sizeof(buffer) - offset, "%s\n", instr);
+        fprintf(ctx->stdin_stream, "%s\n", instr);
     }
     
-    offset += snprintf(buffer + offset, sizeof(buffer) - offset, "END\n");
-    
-    // Write to server
-    ssize_t written = write(ctx->stdin_pipe[1], buffer, offset);
-    if (written != offset) {
-        strcpy(result.error, "Failed to write to server");
-        return result;
-    }
+    // Flush to ensure data is sent
+    fflush(ctx->stdin_stream);
     
     // Read result from server
     char output[128];
-    ssize_t bytes_read = read(ctx->stdout_pipe[0], output, sizeof(output) - 1);
-    if (bytes_read <= 0) {
+    if (!fgets(output, sizeof(output), ctx->stdout_stream)) {
         strcpy(result.error, "Failed to read from server");
         return result;
     }
-    
-    output[bytes_read] = '\0';
     
     // Parse result
     int result_value;
@@ -413,13 +439,13 @@ void free_program(Program *program) {
     }
 }
 
-// Generate next program (returns false when done)
-typedef struct {
+// Program generator structure
+struct ProgramGenerator {
     InstructionList *position_instructions;
     int num_positions;
     int *indices;
     bool first;
-} ProgramGenerator;
+};
 
 ProgramGenerator* create_program_generator(int num_instructions, int max_register) {
     ProgramGenerator *gen = malloc(sizeof(ProgramGenerator));
@@ -470,10 +496,11 @@ bool next_program(ProgramGenerator *gen, Program *program, bool use_optimization
         }
     }
     
-    // Generate program from current indices
+    // Generate program from current indices (reuse existing buffer)
     do {
-        program->length = gen->num_positions + 1;  // +1 for HALT
-        program->instructions = malloc(program->length * sizeof(EncodedInstruction));
+        // Program buffer should already be allocated by caller
+        // program->length should already be set
+        // Just fill in the instructions
         
         for (int i = 0; i < gen->num_positions; i++) {
             const char *instr = gen->position_instructions[i].instructions[gen->indices[i]];
@@ -487,7 +514,7 @@ bool next_program(ProgramGenerator *gen, Program *program, bool use_optimization
         }
         
         if (!is_halt_reachable(program)) {
-            free_program(program);
+            // Don't free - we're reusing the buffer
             
             // Increment for next iteration
             int pos = gen->num_positions - 1;
@@ -504,7 +531,7 @@ bool next_program(ProgramGenerator *gen, Program *program, bool use_optimization
         }
         
         if (has_obvious_infinite_loop(program)) {
-            free_program(program);
+            // Don't free - we're reusing the buffer
             
             // Increment for next iteration
             int pos = gen->num_positions - 1;
@@ -533,6 +560,25 @@ void free_program_generator(ProgramGenerator *gen) {
     free(gen);
 }
 
+// Thread-safe wrapper to get next program from shared generator
+bool get_next_program_threadsafe(SharedGenerator *shared_gen, Program *program, bool use_optimization) {
+    pthread_mutex_lock(&shared_gen->lock);
+    
+    if (shared_gen->exhausted) {
+        pthread_mutex_unlock(&shared_gen->lock);
+        return false;
+    }
+    
+    bool has_next = next_program(shared_gen->generator, program, use_optimization);
+    
+    if (!has_next) {
+        shared_gen->exhausted = true;
+    }
+    
+    pthread_mutex_unlock(&shared_gen->lock);
+    return has_next;
+}
+
 // Worker thread function
 void* worker_thread(void *arg) {
     WorkerContext *ctx = (WorkerContext*)arg;
@@ -543,11 +589,13 @@ void* worker_thread(void *arg) {
         return NULL;
     }
     
-    // Create program generator for this worker
-    ProgramGenerator *gen = create_program_generator(ctx->num_instructions, ctx->max_register);
-    
+    // Reuse program buffer to avoid malloc/free on every iteration
     Program program;
-    while (next_program(gen, &program, true)) {
+    program.length = ctx->num_instructions + 1;  // +1 for HALT
+    program.instructions = malloc(program.length * sizeof(EncodedInstruction));
+    
+    // Process programs from shared generator
+    while (get_next_program_threadsafe(ctx->shared_gen, &program, true)) {
         if (interrupted) break;
         
         // Run program
@@ -597,12 +645,12 @@ void* worker_thread(void *arg) {
             pthread_mutex_unlock(&global_stats.lock);
         }
         
-        free_program(&program);
+        // Note: Do NOT free_program(&program) here - we're reusing the buffer
     }
     
     // Cleanup
+    free_program(&program);  // Free the reused buffer once at the end
     stop_server_process(ctx);
-    free_program_generator(gen);
     
     return NULL;
 }
@@ -661,7 +709,7 @@ int main(int argc, char *argv[]) {
     pthread_mutex_init(&best.lock, NULL);
     
     printf("======================================================================\n");
-    printf("BUSY BEAVER BRUTE FORCE SEARCH (C VERSION)\n");
+    printf("BUSY BEAVER BRUTE FORCE SEARCH (C VERSION - MULTI-THREADED)\n");
     printf("======================================================================\n");
     printf("Instructions (excluding HALT): %d\n", num_instructions);
     printf("Max register: %d\n", max_register);
@@ -670,33 +718,68 @@ int main(int argc, char *argv[]) {
     printf("Counter machine: %s\n", counter_machine_path);
     printf("======================================================================\n\n");
     
-    // Note: For simplicity, using single-threaded generation
-    // Multi-threading would require work-stealing or chunked distribution
-    WorkerContext ctx;
-    ctx.worker_id = 0;
-    strncpy(ctx.counter_machine_path, counter_machine_path, sizeof(ctx.counter_machine_path));
-    ctx.max_steps = max_steps;
-    ctx.max_register = max_register;
-    ctx.num_instructions = num_instructions;
-    ctx.best = &best;
-    ctx.programs_tested = 0;
-    ctx.programs_timed_out = 0;
-    ctx.programs_out_of_range = 0;
-    ctx.programs_errored = 0;
-    ctx.server_pid = 0;
-    ctx.programs_since_restart = 0;
+    // Create shared program generator
+    SharedGenerator shared_gen;
+    shared_gen.generator = create_program_generator(num_instructions, max_register);
+    shared_gen.exhausted = false;
+    pthread_mutex_init(&shared_gen.lock, NULL);
     
-    // Run single-threaded for now
-    worker_thread(&ctx);
+    // Create worker contexts and threads
+    WorkerContext *workers = malloc(num_workers * sizeof(WorkerContext));
+    pthread_t *threads = malloc(num_workers * sizeof(pthread_t));
+    
+    for (int i = 0; i < num_workers; i++) {
+        workers[i].worker_id = i;
+        strncpy(workers[i].counter_machine_path, counter_machine_path, 
+                sizeof(workers[i].counter_machine_path));
+        workers[i].max_steps = max_steps;
+        workers[i].max_register = max_register;
+        workers[i].num_instructions = num_instructions;
+        workers[i].best = &best;
+        workers[i].shared_gen = &shared_gen;
+        workers[i].programs_tested = 0;
+        workers[i].programs_timed_out = 0;
+        workers[i].programs_out_of_range = 0;
+        workers[i].programs_errored = 0;
+        workers[i].server_pid = 0;
+        workers[i].programs_since_restart = 0;
+        
+        if (pthread_create(&threads[i], NULL, worker_thread, &workers[i]) != 0) {
+            fprintf(stderr, "Failed to create worker thread %d\n", i);
+            // Clean up and exit
+            for (int j = 0; j < i; j++) {
+                pthread_cancel(threads[j]);
+            }
+            return 1;
+        }
+    }
+    
+    // Wait for all workers to complete
+    for (int i = 0; i < num_workers; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    // Aggregate statistics from workers
+    unsigned long total_tested = 0;
+    unsigned long total_timed_out = 0;
+    unsigned long total_out_of_range = 0;
+    unsigned long total_errored = 0;
+    
+    for (int i = 0; i < num_workers; i++) {
+        total_tested += workers[i].programs_tested;
+        total_timed_out += workers[i].programs_timed_out;
+        total_out_of_range += workers[i].programs_out_of_range;
+        total_errored += workers[i].programs_errored;
+    }
     
     // Print final results
     printf("\n======================================================================\n");
     printf("SEARCH COMPLETE\n");
     printf("======================================================================\n");
-    printf("Programs tested: %lu\n", ctx.programs_tested);
-    printf("Programs exceeded step limit: %lu\n", ctx.programs_timed_out);
-    printf("Programs went out of range: %lu\n", ctx.programs_out_of_range);
-    printf("Programs with errors: %lu\n", ctx.programs_errored);
+    printf("Programs tested: %lu\n", total_tested);
+    printf("Programs exceeded step limit: %lu\n", total_timed_out);
+    printf("Programs went out of range: %lu\n", total_out_of_range);
+    printf("Programs with errors: %lu\n", total_errored);
     printf("\nLONGEST RUNNING PROGRAM (%d steps):\n", best.steps);
     printf("======================================================================\n");
     
@@ -712,6 +795,10 @@ int main(int argc, char *argv[]) {
     printf("======================================================================\n");
     
     // Cleanup
+    free(workers);
+    free(threads);
+    free_program_generator(shared_gen.generator);
+    pthread_mutex_destroy(&shared_gen.lock);
     pthread_mutex_destroy(&best.lock);
     pthread_mutex_destroy(&global_stats.lock);
     
