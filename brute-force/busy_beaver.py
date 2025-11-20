@@ -639,8 +639,14 @@ def main():
             initializer=init_worker_pool,
             initargs=(counter_machine_path, temp_dir_base, args.max_steps)
         ) as pool:
-            # Use larger chunksize since workers reuse directories
-            optimal_chunk = max(50, min(200, total_programs // (args.workers * 10)))
+            # Use larger chunksize to reduce inter-process communication overhead
+            # For massive runs (100M+ programs), use much larger chunks
+            if total_programs > 100_000_000:
+                optimal_chunk = max(10000, min(50000, total_programs // (args.workers * 3)))
+            elif total_programs > 1_000_000:
+                optimal_chunk = max(2000, min(10000, total_programs // (args.workers * 5)))
+            else:
+                optimal_chunk = max(200, min(1000, total_programs // (args.workers * 10)))
             
             # Use imap_unordered for better performance (results come back as they complete)
             for program, (steps, exceeded_limit, error) in pool.imap_unordered(
