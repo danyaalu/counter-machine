@@ -2,6 +2,7 @@
 program.txt
 registers.txt
 countermachine
+busy_beaver
 
 # IDE files and dirs 
 .vscode/

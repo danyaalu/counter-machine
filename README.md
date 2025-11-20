@@ -11,7 +11,7 @@ A counter machine is a theoretical model of computation that uses a set of regis
 Compile the program using gcc:
 
 ```bash
-gcc -o countermachine main.c
+    gcc -o countermachine main.c
 ```
 
 ## Setup
