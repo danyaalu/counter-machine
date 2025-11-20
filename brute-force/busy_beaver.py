@@ -237,12 +237,16 @@ def filter_program(encoded_program):
     
     return (encoded_program, True, None)
 
-def generate_all_programs(num_instructions, max_register, use_optimization=True, workers=None):
-    total_lines = num_instructions + 1  # +1 for HALT
+def generate_programs_streaming(num_instructions, max_register, use_optimization=True):
+    """
+    Generate programs lazily without storing them all in memory.
+    Yields encoded programs one at a time, applying filters inline.
+    This is memory-efficient for massive searches (millions/billions of programs).
+    """
+    total_lines = num_instructions + 1
     
     # Generate all possible instructions for each position
     all_position_instructions = []
-    
     for line_num in range(1, num_instructions + 1):
         position_instructions = []
         for opcode in OPCODES:
@@ -251,74 +255,54 @@ def generate_all_programs(num_instructions, max_register, use_optimization=True,
             )
         all_position_instructions.append(position_instructions)
     
-    # Generate all combinations (cartesian product)
+    # Calculate total for statistics
     total_programs = 1
     for pos_instructions in all_position_instructions:
         total_programs *= len(pos_instructions)
     
-    print(f"Total programs to test: {total_programs:,}")
+    print(f"Total programs to generate: {total_programs:,}")
+    print(f"Mode: STREAMING (memory-efficient)")
+    print(f"Filters: {'ENABLED' if use_optimization else 'DISABLED'}\n")
     
-    if not use_optimization:
-        print(f"Optimizations DISABLED - generating all programs...")
-        all_programs = []
-        for program_tuple in itertools.product(*all_position_instructions):
-            program = list(program_tuple)
-            program.append('HALT')
-            # Encode before storing
-            encoded = encode_program(program)
-            all_programs.append(encoded)
-        print(f"Programs to test (no optimization): {len(all_programs):,}\n")
-        return all_programs
+    # Statistics
+    generated = 0
+    skipped_unreachable = 0
+    skipped_infinite = 0
     
-    # Apply optimizations in parallel
-    print(f"Applying optimizations in parallel with {workers or cpu_count()} workers...")
-    
-    # Generate all programs first
-    print("Generating program combinations...")
-    all_programs_raw = []
+    # Generate programs lazily
     for program_tuple in itertools.product(*all_position_instructions):
         program = list(program_tuple)
         program.append('HALT')
-        # Encode before storing
-        encoded = encode_program(program)
-        all_programs_raw.append(encoded)
-    
-    print(f"Generated {len(all_programs_raw):,} programs, filtering in parallel...")
-    
-    # Filter in parallel
-    programs_kept = []
-    programs_skipped_unreachable = 0
-    programs_skipped_infinite = 0
-    
-    with Pool(processes=workers) as pool:
-        # Use imap_unordered for better performance with progress tracking
-        chunk_size = 1000
-        processed = 0
+        generated += 1
         
-        for encoded_program, should_keep, skip_reason in pool.imap_unordered(
-            filter_program, all_programs_raw, chunksize=chunk_size
-        ):
-            processed += 1
-            
-            if should_keep:
-                programs_kept.append(encoded_program)
-            elif skip_reason == 'unreachable':
-                programs_skipped_unreachable += 1
-            elif skip_reason == 'infinite':
-                programs_skipped_infinite += 1
-            
-            # Progress update every 50,000 programs
-            if processed % 50000 == 0:
-                percent = (processed / len(all_programs_raw)) * 100
-                print(f"  Filtering progress: {processed:,}/{len(all_programs_raw):,} ({percent:.1f}%) - "
-                      f"kept: {len(programs_kept):,}")
+        # Apply filters inline if optimization enabled
+        if use_optimization:
+            if not is_halt_reachable(program):
+                skipped_unreachable += 1
+                continue
+            if has_obvious_infinite_loop(program):
+                skipped_infinite += 1
+                continue
+        
+        # Encode and yield
+        yield encode_program(program)
+        
+        # Progress update during generation (every 10M programs)
+        if generated % 10_000_000 == 0:
+            percent = (generated / total_programs) * 100
+            yielded = generated - skipped_unreachable - skipped_infinite
+            print(f"  Generation progress: {generated:,}/{total_programs:,} ({percent:.1f}%) - "
+                  f"yielded: {yielded:,}, skipped: {skipped_unreachable + skipped_infinite:,}")
     
-    print(f"Programs after optimization: {len(programs_kept):,}")
-    print(f"  - Skipped {programs_skipped_unreachable:,} with unreachable HALT")
-    print(f"  - Skipped {programs_skipped_infinite:,} with obvious infinite loops")
+    # Final statistics
+    yielded = generated - skipped_unreachable - skipped_infinite
+    print(f"\nGeneration complete:")
+    print(f"  Total generated: {generated:,}")
+    print(f"  Yielded for testing: {yielded:,}")
+    if use_optimization:
+        print(f"  Skipped (unreachable): {skipped_unreachable:,}")
+        print(f"  Skipped (infinite): {skipped_infinite:,}")
     print()
-    
-    return programs_kept
 
 def create_empty_registers(filepath):
     with open(filepath, 'w') as f:
@@ -602,7 +586,7 @@ def main():
     temp_dir_base.mkdir(exist_ok=True)
     
     print(f"{'='*70}")
-    print(f"BUSY BEAVER BRUTE FORCE SEARCH (SERVER MODE)")
+    print(f"BUSY BEAVER BRUTE FORCE SEARCH (SERVER MODE - STREAMING)")
     print(f"{'='*70}")
     print(f"Instructions (excluding HALT): {args.num_instructions}")
     print(f"Max register: {args.max_register}")
@@ -611,6 +595,7 @@ def main():
     print(f"Server restart interval: ~{_worker_restart_interval:,} programs (with jitter)")
     print(f"Optimizations: {'DISABLED' if args.no_optimization else 'ENABLED'}")
     print(f"Counter machine: {counter_machine_path}")
+    print(f"Memory mode: STREAMING (minimal RAM usage)")
     print(f"{'='*70}\n")
     
     # Track the best program
@@ -621,16 +606,13 @@ def main():
     programs_out_of_range = 0
     programs_errored = 0
     
-    # Generate and filter all programs (filtering done in parallel)
+    # Generate programs lazily - no memory storage!
     use_optimization = not args.no_optimization
-    all_programs = generate_all_programs(
+    program_generator = generate_programs_streaming(
         args.num_instructions, 
         args.max_register, 
-        use_optimization,
-        workers=args.workers
+        use_optimization
     )
-    total_programs = len(all_programs)
-    print(f"Testing {total_programs:,} programs with {args.workers} workers...\n")
     
     # Run programs in parallel with worker reuse
     try:
@@ -639,18 +621,19 @@ def main():
             initializer=init_worker_pool,
             initargs=(counter_machine_path, temp_dir_base, args.max_steps)
         ) as pool:
-            # Use larger chunksize to reduce inter-process communication overhead
-            # For massive runs (100M+ programs), use much larger chunks
-            if total_programs > 100_000_000:
-                optimal_chunk = max(10000, min(50000, total_programs // (args.workers * 3)))
-            elif total_programs > 1_000_000:
-                optimal_chunk = max(2000, min(10000, total_programs // (args.workers * 5)))
+            # Use very large chunksize for massive runs to minimize generator overhead
+            if args.num_instructions >= 5:
+                optimal_chunk = 10000  # Large chunks for huge searches
+            elif args.num_instructions >= 4:
+                optimal_chunk = 5000
             else:
-                optimal_chunk = max(200, min(1000, total_programs // (args.workers * 10)))
+                optimal_chunk = 1000
+            
+            print(f"Using chunk size: {optimal_chunk:,} programs per worker batch\n")
             
             # Use imap_unordered for better performance (results come back as they complete)
             for program, (steps, exceeded_limit, error) in pool.imap_unordered(
-                run_program_server, all_programs, chunksize=optimal_chunk
+                run_program_server, program_generator, chunksize=optimal_chunk
             ):
                 programs_tested += 1
                 
@@ -671,11 +654,10 @@ def main():
                     print(format_program(best_program))
                     print(f"{'*'*70}\n")
                 
-                # Progress update every 100 programs
+                # Progress update every 100 programs (no total in streaming mode)
                 if programs_tested % 100 == 0:
-                    percent = (programs_tested / total_programs) * 100
                     try:
-                        print(f"Progress: {programs_tested:,}/{total_programs:,} ({percent:.1f}%) - "
+                        print(f"Progress: {programs_tested:,} tested - "
                               f"best: {best_steps:,} steps "
                               f"(exceeded: {programs_timed_out}, out-of-range: {programs_out_of_range}, errors: {programs_errored})")
                     except BrokenPipeError:
