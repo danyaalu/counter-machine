@@ -13,6 +13,7 @@
 
 // Available opcodes (excluding HALT which is always last)
 #define NUM_OPCODES 6
+#define QUEUE_SIZE 1000  // Buffer size for work queue (can hold 1000 programs)
 // static const char *OPCODES[] = {"IF", "DEC", "INC", "COPY", "GOTO", "CLR"};  // Not used in C version
 
 // Opcode enum matching Python's encoding
@@ -45,6 +46,20 @@ typedef struct {
 // Forward declarations
 typedef struct ProgramGenerator ProgramGenerator;
 typedef struct SharedGenerator SharedGenerator;
+typedef struct WorkQueue WorkQueue;
+
+// Work queue for producer-consumer model
+struct WorkQueue {
+    Program *programs;      // Ring buffer of programs
+    int capacity;           // Max size of queue
+    int size;              // Current number of items
+    int head;              // Read position
+    int tail;              // Write position
+    pthread_mutex_t lock;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+    bool producer_done;    // Producer finished generating
+};
 
 // Best program tracking (shared across threads)
 typedef struct {
@@ -68,7 +83,7 @@ typedef struct {
     int max_register;
     int num_instructions;
     BestProgram *best;
-    SharedGenerator *shared_gen;
+    WorkQueue *work_queue;
     
     // Statistics
     unsigned long programs_tested;
@@ -85,6 +100,14 @@ typedef struct {
     int programs_since_restart;
     int restart_threshold;
 } WorkerContext;
+
+// Producer thread data
+typedef struct {
+    ProgramGenerator *generator;
+    WorkQueue *work_queue;
+    int num_instructions;
+    int max_register;
+} ProducerContext;
 
 // Global statistics
 typedef struct {
@@ -560,23 +583,119 @@ void free_program_generator(ProgramGenerator *gen) {
     free(gen);
 }
 
-// Thread-safe wrapper to get next program from shared generator
-bool get_next_program_threadsafe(SharedGenerator *shared_gen, Program *program, bool use_optimization) {
-    pthread_mutex_lock(&shared_gen->lock);
+// Work queue functions
+WorkQueue* create_work_queue(int capacity, int program_length) {
+    WorkQueue *queue = malloc(sizeof(WorkQueue));
+    queue->capacity = capacity;
+    queue->size = 0;
+    queue->head = 0;
+    queue->tail = 0;
+    queue->producer_done = false;
     
-    if (shared_gen->exhausted) {
-        pthread_mutex_unlock(&shared_gen->lock);
+    pthread_mutex_init(&queue->lock, NULL);
+    pthread_cond_init(&queue->not_empty, NULL);
+    pthread_cond_init(&queue->not_full, NULL);
+    
+    // Pre-allocate all program buffers
+    queue->programs = malloc(capacity * sizeof(Program));
+    for (int i = 0; i < capacity; i++) {
+        queue->programs[i].length = program_length;
+        queue->programs[i].instructions = malloc(program_length * sizeof(EncodedInstruction));
+    }
+    
+    return queue;
+}
+
+void free_work_queue(WorkQueue *queue) {
+    for (int i = 0; i < queue->capacity; i++) {
+        free(queue->programs[i].instructions);
+    }
+    free(queue->programs);
+    pthread_mutex_destroy(&queue->lock);
+    pthread_cond_destroy(&queue->not_empty);
+    pthread_cond_destroy(&queue->not_full);
+    free(queue);
+}
+
+bool queue_push(WorkQueue *queue, Program *program) {
+    pthread_mutex_lock(&queue->lock);
+    
+    // Wait while queue is full
+    while (queue->size >= queue->capacity && !interrupted) {
+        pthread_cond_wait(&queue->not_full, &queue->lock);
+    }
+    
+    if (interrupted) {
+        pthread_mutex_unlock(&queue->lock);
         return false;
     }
     
-    bool has_next = next_program(shared_gen->generator, program, use_optimization);
+    // Copy program into queue buffer
+    Program *dest = &queue->programs[queue->tail];
+    memcpy(dest->instructions, program->instructions, 
+           program->length * sizeof(EncodedInstruction));
     
-    if (!has_next) {
-        shared_gen->exhausted = true;
+    queue->tail = (queue->tail + 1) % queue->capacity;
+    queue->size++;
+    
+    pthread_cond_signal(&queue->not_empty);
+    pthread_mutex_unlock(&queue->lock);
+    
+    return true;
+}
+
+bool queue_pop(WorkQueue *queue, Program *program) {
+    pthread_mutex_lock(&queue->lock);
+    
+    // Wait while queue is empty and producer not done
+    while (queue->size == 0 && !queue->producer_done && !interrupted) {
+        pthread_cond_wait(&queue->not_empty, &queue->lock);
     }
     
-    pthread_mutex_unlock(&shared_gen->lock);
-    return has_next;
+    if (interrupted || (queue->size == 0 && queue->producer_done)) {
+        pthread_mutex_unlock(&queue->lock);
+        return false;
+    }
+    
+    // Copy program from queue
+    Program *src = &queue->programs[queue->head];
+    memcpy(program->instructions, src->instructions,
+           program->length * sizeof(EncodedInstruction));
+    
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->size--;
+    
+    pthread_cond_signal(&queue->not_full);
+    pthread_mutex_unlock(&queue->lock);
+    
+    return true;
+}
+
+void queue_mark_done(WorkQueue *queue) {
+    pthread_mutex_lock(&queue->lock);
+    queue->producer_done = true;
+    pthread_cond_broadcast(&queue->not_empty);  // Wake all waiting consumers
+    pthread_mutex_unlock(&queue->lock);
+}
+
+// Producer thread function
+void* producer_thread(void *arg) {
+    ProducerContext *ctx = (ProducerContext*)arg;
+    
+    Program program;
+    program.length = ctx->num_instructions + 1;  // +1 for HALT
+    program.instructions = malloc(program.length * sizeof(EncodedInstruction));
+    
+    while (next_program(ctx->generator, &program, true) && !interrupted) {
+        if (!queue_push(ctx->work_queue, &program)) {
+            break;
+        }
+    }
+    
+    free(program.instructions);
+    queue_mark_done(ctx->work_queue);
+    
+    return NULL;
 }
 
 // Worker thread function
@@ -589,13 +708,13 @@ void* worker_thread(void *arg) {
         return NULL;
     }
     
-    // Reuse program buffer to avoid malloc/free on every iteration
+    // Allocate program buffer
     Program program;
     program.length = ctx->num_instructions + 1;  // +1 for HALT
     program.instructions = malloc(program.length * sizeof(EncodedInstruction));
     
-    // Process programs from shared generator
-    while (get_next_program_threadsafe(ctx->shared_gen, &program, true)) {
+    // Process programs from work queue
+    while (queue_pop(ctx->work_queue, &program)) {
         if (interrupted) break;
         
         // Run program
@@ -709,20 +828,36 @@ int main(int argc, char *argv[]) {
     pthread_mutex_init(&best.lock, NULL);
     
     printf("======================================================================\n");
-    printf("BUSY BEAVER BRUTE FORCE SEARCH (C VERSION - MULTI-THREADED)\n");
+    printf("BUSY BEAVER BRUTE FORCE SEARCH (C VERSION - PRODUCER-CONSUMER)\n");
     printf("======================================================================\n");
     printf("Instructions (excluding HALT): %d\n", num_instructions);
     printf("Max register: %d\n", max_register);
     printf("Max steps per program: %d\n", max_steps);
     printf("Parallel workers: %d\n", num_workers);
+    printf("Work queue size: %d\n", QUEUE_SIZE);
     printf("Counter machine: %s\n", counter_machine_path);
     printf("======================================================================\n\n");
     
-    // Create shared program generator
-    SharedGenerator shared_gen;
-    shared_gen.generator = create_program_generator(num_instructions, max_register);
-    shared_gen.exhausted = false;
-    pthread_mutex_init(&shared_gen.lock, NULL);
+    // Create work queue
+    WorkQueue *queue = create_work_queue(QUEUE_SIZE, num_instructions + 1);
+    if (!queue) {
+        fprintf(stderr, "Failed to create work queue\n");
+        return 1;
+    }
+    
+    // Create producer context and thread
+    ProducerContext prod_ctx;
+    prod_ctx.work_queue = queue;
+    prod_ctx.generator = create_program_generator(num_instructions, max_register);
+    prod_ctx.num_instructions = num_instructions;
+    
+    pthread_t producer;
+    if (pthread_create(&producer, NULL, producer_thread, &prod_ctx) != 0) {
+        fprintf(stderr, "Failed to create producer thread\n");
+        free_work_queue(queue);
+        free_program_generator(prod_ctx.generator);
+        return 1;
+    }
     
     // Create worker contexts and threads
     WorkerContext *workers = malloc(num_workers * sizeof(WorkerContext));
@@ -736,7 +871,7 @@ int main(int argc, char *argv[]) {
         workers[i].max_register = max_register;
         workers[i].num_instructions = num_instructions;
         workers[i].best = &best;
-        workers[i].shared_gen = &shared_gen;
+        workers[i].work_queue = queue;
         workers[i].programs_tested = 0;
         workers[i].programs_timed_out = 0;
         workers[i].programs_out_of_range = 0;
@@ -750,9 +885,17 @@ int main(int argc, char *argv[]) {
             for (int j = 0; j < i; j++) {
                 pthread_cancel(threads[j]);
             }
+            pthread_cancel(producer);
+            free(workers);
+            free(threads);
+            free_work_queue(queue);
+            free_program_generator(prod_ctx.generator);
             return 1;
         }
     }
+    
+    // Wait for producer to finish
+    pthread_join(producer, NULL);
     
     // Wait for all workers to complete
     for (int i = 0; i < num_workers; i++) {
@@ -797,8 +940,8 @@ int main(int argc, char *argv[]) {
     // Cleanup
     free(workers);
     free(threads);
-    free_program_generator(shared_gen.generator);
-    pthread_mutex_destroy(&shared_gen.lock);
+    free_program_generator(prod_ctx.generator);
+    free_work_queue(queue);
     pthread_mutex_destroy(&best.lock);
     pthread_mutex_destroy(&global_stats.lock);
     
