@@ -445,10 +445,9 @@ bool start_server_process(WorkerContext *ctx) {
     // Set line buffering
     setvbuf(ctx->stdin_stream, NULL, _IOLBF, 0);
     setvbuf(ctx->stdout_stream, NULL, _IOLBF, 0);
-    
-    // Set new restart threshold with jitter
+
     double jitter = 0.8 + (rand() / (double)RAND_MAX) * 0.4;  // 0.8 to 1.2
-    ctx->restart_threshold = (int)(5000 * jitter);
+    ctx->restart_threshold = (int)(100000 * jitter);
     
     // Give the server a moment to start up
     usleep(10000);  // 10ms
