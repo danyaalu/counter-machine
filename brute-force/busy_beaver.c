@@ -14,7 +14,6 @@
 // Available opcodes (excluding HALT which is always last)
 #define NUM_OPCODES 6
 #define QUEUE_SIZE 1000  // Buffer size for work queue (can hold 1000 programs)
-// static const char *OPCODES[] = {"IF", "DEC", "INC", "COPY", "GOTO", "CLR"};  // Not used in C version
 
 // Opcode enum matching Python's encoding
 typedef enum {
@@ -116,6 +115,9 @@ typedef struct {
     unsigned long programs_timed_out;
     unsigned long programs_out_of_range;
     unsigned long programs_errored;
+    unsigned long programs_filtered_unreachable;  // Filtered by is_halt_reachable
+    unsigned long programs_filtered_infinite;     // Filtered by has_obvious_infinite_loop
+    unsigned long programs_filtered_cfg;          // Filtered by cfg_reaches_halt
     pthread_mutex_t lock;
 } Statistics;
 
@@ -281,6 +283,130 @@ bool has_obvious_infinite_loop(Program *program) {
     }
     
     return false;
+}
+
+// CFG-based reachability analysis: DFS helper for forward reachability
+void dfs_forward(Program *program, int line, bool *visited) {
+    // Line numbers are 1-indexed, array is 0-indexed
+    int idx = line - 1;
+    
+    if (idx < 0 || idx >= program->length || visited[idx]) {
+        return;
+    }
+    
+    visited[idx] = true;
+    
+    // If this is HALT, stop here
+    char instr[64];
+    decode_instruction(program->instructions[idx], instr, sizeof(instr));
+    
+    char opcode[32];
+    int arg1 = 0, arg2 = 0;
+    sscanf(instr, "%s %d %d", opcode, &arg1, &arg2);
+    
+    if (strcmp(opcode, "HALT") == 0) {
+        return;
+    }
+    
+    // Build edges based on instruction type
+    if (strcmp(opcode, "GOTO") == 0) {
+        // Unconditional jump: only edge is to target
+        dfs_forward(program, arg1, visited);
+    } else if (strcmp(opcode, "IF") == 0) {
+        // Conditional: both branches possible
+        dfs_forward(program, arg2, visited);      // Jump target
+        dfs_forward(program, line + 1, visited);  // Fall through
+    } else {
+        // Normal instructions (INC/DEC/CLR/COPY): fall through to next
+        dfs_forward(program, line + 1, visited);
+    }
+}
+
+// CFG-based reachability analysis: DFS helper for backward reachability
+void dfs_backward(Program *program, int target_line, bool *can_reach, bool *visited) {
+    // target_line is what we're checking can reach from
+    int idx = target_line - 1;
+    
+    if (idx < 0 || idx >= program->length || visited[idx]) {
+        return;
+    }
+    
+    visited[idx] = true;
+    
+    // This line can reach the target
+    can_reach[idx] = true;
+    
+    // Find all lines that can jump to this line
+    for (int line = 1; line <= program->length; line++) {
+        int i = line - 1;
+        
+        char instr[64];
+        decode_instruction(program->instructions[i], instr, sizeof(instr));
+        
+        char opcode[32];
+        int arg1 = 0, arg2 = 0;
+        sscanf(instr, "%s %d %d", opcode, &arg1, &arg2);
+        
+        bool has_edge_to_target = false;
+        
+        if (strcmp(opcode, "HALT") == 0) {
+            // HALT has no outgoing edges
+            continue;
+        } else if (strcmp(opcode, "GOTO") == 0) {
+            // GOTO only goes to its target
+            has_edge_to_target = (arg1 == target_line);
+        } else if (strcmp(opcode, "IF") == 0) {
+            // IF has two edges
+            has_edge_to_target = (arg2 == target_line || line + 1 == target_line);
+        } else {
+            // Normal instructions fall through
+            has_edge_to_target = (line + 1 == target_line);
+        }
+        
+        if (has_edge_to_target) {
+            dfs_backward(program, line, can_reach, visited);
+        }
+    }
+}
+
+// Check if HALT is reachable from all reachable code (CFG analysis)
+bool cfg_reaches_halt(Program *program) {
+    if (program->length <= 1) return true;
+    
+    // Allocate reachability arrays (stack allocation for small programs)
+    bool forward_reach[32] = {false};   // Reachable from line 1
+    bool backward_reach[32] = {false};  // Can reach HALT
+    bool visited[32] = {false};
+    
+    if (program->length > 32) {
+        // Shouldn't happen in practice, but safety check
+        return true;
+    }
+    
+    // Compute forward reachability from line 1
+    dfs_forward(program, 1, forward_reach);
+    
+    // Compute backward reachability from HALT (last line)
+    dfs_backward(program, program->length, backward_reach, visited);
+    
+    // Check if line 1 can reach HALT
+    if (!backward_reach[0]) {
+        return false;  // HALT is unreachable from start
+    }
+    
+    // Check for dead code: any non-HALT line that is either:
+    // 1. Not reachable from start (dead code), OR
+    // 2. Reachable but cannot reach HALT (leads nowhere useful)
+    for (int i = 0; i < program->length - 1; i++) {  // Exclude HALT itself
+        if (!forward_reach[i]) {
+            return false;  // Dead code: unreachable from start
+        }
+        if (forward_reach[i] && !backward_reach[i]) {
+            return false;  // Reachable but cannot reach HALT
+        }
+    }
+    
+    return true;
 }
 
 // Start server process for a worker
@@ -537,6 +663,11 @@ bool next_program(ProgramGenerator *gen, Program *program, bool use_optimization
         }
         
         if (!is_halt_reachable(program)) {
+            // Track filtered programs
+            pthread_mutex_lock(&global_stats.lock);
+            global_stats.programs_filtered_unreachable++;
+            pthread_mutex_unlock(&global_stats.lock);
+            
             // Don't free - we're reusing the buffer
             
             // Increment for next iteration
@@ -554,6 +685,34 @@ bool next_program(ProgramGenerator *gen, Program *program, bool use_optimization
         }
         
         if (has_obvious_infinite_loop(program)) {
+            // Track filtered programs
+            pthread_mutex_lock(&global_stats.lock);
+            global_stats.programs_filtered_infinite++;
+            pthread_mutex_unlock(&global_stats.lock);
+            
+            // Don't free - we're reusing the buffer
+            
+            // Increment for next iteration
+            int pos = gen->num_positions - 1;
+            while (pos >= 0) {
+                gen->indices[pos]++;
+                if (gen->indices[pos] < gen->position_instructions[pos].count) {
+                    break;
+                }
+                gen->indices[pos] = 0;
+                pos--;
+            }
+            if (pos < 0) return false;
+            continue;
+        }
+        
+        // CFG-based reachability check
+        if (!cfg_reaches_halt(program)) {
+            // Track filtered programs
+            pthread_mutex_lock(&global_stats.lock);
+            global_stats.programs_filtered_cfg++;
+            pthread_mutex_unlock(&global_stats.lock);
+            
             // Don't free - we're reusing the buffer
             
             // Increment for next iteration
@@ -923,6 +1082,21 @@ int main(int argc, char *argv[]) {
     printf("Programs exceeded step limit: %lu\n", total_timed_out);
     printf("Programs went out of range: %lu\n", total_out_of_range);
     printf("Programs with errors: %lu\n", total_errored);
+    
+    // Print filter statistics
+    pthread_mutex_lock(&global_stats.lock);
+    unsigned long filtered_unreachable = global_stats.programs_filtered_unreachable;
+    unsigned long filtered_infinite = global_stats.programs_filtered_infinite;
+    unsigned long filtered_cfg = global_stats.programs_filtered_cfg;
+    pthread_mutex_unlock(&global_stats.lock);
+    
+    unsigned long total_filtered = filtered_unreachable + filtered_infinite + filtered_cfg;
+    printf("\nPrograms filtered (not tested):\n");
+    printf("  - Unreachable HALT: %lu\n", filtered_unreachable);
+    printf("  - Obvious infinite loops: %lu\n", filtered_infinite);
+    printf("  - CFG dead code/unreachable: %lu\n", filtered_cfg);
+    printf("  - Total filtered: %lu\n", total_filtered);
+    
     printf("\nLONGEST RUNNING PROGRAM (%d steps):\n", best.steps);
     printf("======================================================================\n");
     
