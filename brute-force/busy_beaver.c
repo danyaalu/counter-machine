@@ -116,7 +116,6 @@ typedef struct {
     unsigned long programs_out_of_range;
     unsigned long programs_errored;
     unsigned long programs_filtered_unreachable;  // Filtered by is_halt_reachable
-    unsigned long programs_filtered_infinite;     // Filtered by has_obvious_infinite_loop
     unsigned long programs_filtered_cfg;          // Filtered by cfg_reaches_halt
     pthread_mutex_t lock;
 } Statistics;
@@ -262,27 +261,6 @@ bool is_halt_reachable(Program *program) {
     }
     
     return true;
-}
-
-// Check for obvious infinite loops
-bool has_obvious_infinite_loop(Program *program) {
-    for (int i = 0; i < program->length - 1; i++) {
-        char instr[64];
-        decode_instruction(program->instructions[i], instr, sizeof(instr));
-        
-        char opcode[32];
-        int target = 0;
-        sscanf(instr, "%s %d", opcode, &target);
-        
-        int current_line = i + 1;
-        
-        // Unconditional backward GOTO = definite infinite loop
-        if (strcmp(opcode, "GOTO") == 0 && target <= current_line) {
-            return true;
-        }
-    }
-    
-    return false;
 }
 
 // CFG-based reachability analysis: DFS helper for forward reachability
@@ -684,28 +662,6 @@ bool next_program(ProgramGenerator *gen, Program *program, bool use_optimization
             continue;
         }
         
-        if (has_obvious_infinite_loop(program)) {
-            // Track filtered programs
-            pthread_mutex_lock(&global_stats.lock);
-            global_stats.programs_filtered_infinite++;
-            pthread_mutex_unlock(&global_stats.lock);
-            
-            // Don't free - we're reusing the buffer
-            
-            // Increment for next iteration
-            int pos = gen->num_positions - 1;
-            while (pos >= 0) {
-                gen->indices[pos]++;
-                if (gen->indices[pos] < gen->position_instructions[pos].count) {
-                    break;
-                }
-                gen->indices[pos] = 0;
-                pos--;
-            }
-            if (pos < 0) return false;
-            continue;
-        }
-        
         // CFG-based reachability check
         if (!cfg_reaches_halt(program)) {
             // Track filtered programs
@@ -1086,14 +1042,12 @@ int main(int argc, char *argv[]) {
     // Print filter statistics
     pthread_mutex_lock(&global_stats.lock);
     unsigned long filtered_unreachable = global_stats.programs_filtered_unreachable;
-    unsigned long filtered_infinite = global_stats.programs_filtered_infinite;
     unsigned long filtered_cfg = global_stats.programs_filtered_cfg;
     pthread_mutex_unlock(&global_stats.lock);
     
-    unsigned long total_filtered = filtered_unreachable + filtered_infinite + filtered_cfg;
+    unsigned long total_filtered = filtered_unreachable + filtered_cfg;
     printf("\nPrograms filtered (not tested):\n");
-    printf("  - Unreachable HALT: %lu\n", filtered_unreachable);
-    printf("  - Obvious infinite loops: %lu\n", filtered_infinite);
+    printf("  - Unreachable HALT (simple check): %lu\n", filtered_unreachable);
     printf("  - CFG dead code/unreachable: %lu\n", filtered_cfg);
     printf("  - Total filtered: %lu\n", total_filtered);
     
