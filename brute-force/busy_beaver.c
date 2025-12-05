@@ -3,18 +3,18 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <sys/types.h>
 #include <time.h>
 #include <pthread.h>
 #include <signal.h>
-#include <errno.h>
+
+#ifdef __unix__
+#include <unistd.h>  // For sysconf(_SC_NPROCESSORS_ONLN)
+#endif
 
 // Available opcodes (excluding HALT which is always last)
 #define NUM_OPCODES 6
 #define QUEUE_SIZE 1000  // Buffer size for work queue (can hold 1000 programs)
-// static const char *OPCODES[] = {"IF", "DEC", "INC", "COPY", "GOTO", "CLR"};  // Not used in C version
+#define MAX_REGISTERS 64 // Maximum number of registers for inline execution
 
 // Opcode enum matching Python's encoding
 typedef enum {
@@ -78,7 +78,6 @@ struct SharedGenerator {
 // Worker thread data
 typedef struct {
     int worker_id;
-    char counter_machine_path[512];
     int max_steps;
     int max_register;
     int num_instructions;
@@ -91,14 +90,8 @@ typedef struct {
     unsigned long programs_out_of_range;
     unsigned long programs_errored;
     
-    // Server process info
-    pid_t server_pid;
-    int stdin_pipe[2];
-    int stdout_pipe[2];
-    FILE *stdin_stream;
-    FILE *stdout_stream;
-    int programs_since_restart;
-    int restart_threshold;
+    // Inline execution: pre-allocated register array
+    uint64_t registers[MAX_REGISTERS];
 } WorkerContext;
 
 // Producer thread data
@@ -283,157 +276,113 @@ bool has_obvious_infinite_loop(Program *program) {
     return false;
 }
 
-// Start server process for a worker
-bool start_server_process(WorkerContext *ctx) {
-    // Create pipes for stdin and stdout
-    if (pipe(ctx->stdin_pipe) == -1 || pipe(ctx->stdout_pipe) == -1) {
-        perror("pipe");
-        return false;
-    }
-    
-    pid_t pid = fork();
-    if (pid == -1) {
-        perror("fork");
-        return false;
-    }
-    
-    if (pid == 0) {
-        // Child process
-        close(ctx->stdin_pipe[1]);  // Close write end
-        close(ctx->stdout_pipe[0]); // Close read end
-        
-        // Redirect stdin and stdout
-        dup2(ctx->stdin_pipe[0], STDIN_FILENO);
-        dup2(ctx->stdout_pipe[1], STDOUT_FILENO);
-        
-        // Close unused file descriptors
-        close(ctx->stdin_pipe[0]);
-        close(ctx->stdout_pipe[1]);
-        
-        // Execute counter machine in server mode
-        char max_steps_str[32];
-        snprintf(max_steps_str, sizeof(max_steps_str), "%d", ctx->max_steps);
-        
-        execl(ctx->counter_machine_path, ctx->counter_machine_path, 
-              "--server", "-s", max_steps_str, NULL);
-        
-        // If exec fails
-        perror("execl");
-        exit(1);
-    }
-    
-    // Parent process
-    close(ctx->stdin_pipe[0]);  // Close read end
-    close(ctx->stdout_pipe[1]); // Close write end
-    
-    ctx->server_pid = pid;
-    ctx->programs_since_restart = 0;
-    
-    // Convert file descriptors to FILE* streams for buffering
-    ctx->stdin_stream = fdopen(ctx->stdin_pipe[1], "w");
-    ctx->stdout_stream = fdopen(ctx->stdout_pipe[0], "r");
-    
-    if (!ctx->stdin_stream || !ctx->stdout_stream) {
-        perror("fdopen");
-        return false;
-    }
-    
-    // Set line buffering
-    setvbuf(ctx->stdin_stream, NULL, _IOLBF, 0);
-    setvbuf(ctx->stdout_stream, NULL, _IOLBF, 0);
-    
-    // Set new restart threshold with jitter
-    double jitter = 0.8 + (rand() / (double)RAND_MAX) * 0.4;  // 0.8 to 1.2
-    ctx->restart_threshold = (int)(5000 * jitter);
-    
-    // Give the server a moment to start up
-    usleep(10000);  // 10ms
-    
-    return true;
-}
-
-// Stop server process
-void stop_server_process(WorkerContext *ctx) {
-    if (ctx->server_pid > 0) {
-        // Close streams first
-        if (ctx->stdin_stream) {
-            fclose(ctx->stdin_stream);
-            ctx->stdin_stream = NULL;
-        }
-        if (ctx->stdout_stream) {
-            fclose(ctx->stdout_stream);
-            ctx->stdout_stream = NULL;
-        }
-        
-        kill(ctx->server_pid, SIGKILL);
-        waitpid(ctx->server_pid, NULL, 0);
-        ctx->server_pid = 0;
-    }
-}
-
-// Send program to server and get result
-ExecutionResult run_program_on_server(WorkerContext *ctx, Program *program) {
+// Inline counter machine execution - no subprocess overhead!
+// Directly executes the encoded program and returns result
+ExecutionResult run_program_inline(WorkerContext *ctx, Program *program) {
     ExecutionResult result = {0};
     
-    // Restart server periodically to prevent hangs
-    if (ctx->programs_since_restart >= ctx->restart_threshold) {
-        stop_server_process(ctx);
-        if (!start_server_process(ctx)) {
-            strcpy(result.error, "Failed to restart server");
+    // Clear registers (use ctx's pre-allocated buffer)
+    memset(ctx->registers, 0, MAX_REGISTERS * sizeof(uint64_t));
+    
+    int pc = 0;  // Program counter (0-based)
+    uint64_t step_count = 0;
+    int program_length = program->length;
+    uint64_t max_steps = (uint64_t)ctx->max_steps;
+    
+    // Main execution loop
+    while (pc >= 0 && pc < program_length) {
+        step_count++;
+        
+        // Check step limit
+        if (step_count > max_steps) {
+            result.steps = 0;
+            result.exceeded_limit = true;
+            strcpy(result.error, "Step limit exceeded");
             return result;
+        }
+        
+        // Decode instruction inline (avoid function call overhead)
+        EncodedInstruction encoded = program->instructions[pc];
+        Opcode opcode = (encoded >> 16) & 0x7;
+        int arg1 = (encoded >> 8) & 0xFF;
+        int arg2 = encoded & 0xFF;
+        
+        // Convert 1-based args to 0-based register indices
+        int reg_a = arg1 - 1;
+        int reg_b = arg2 - 1;
+        
+        switch (opcode) {
+            case OP_IF: {
+                // IF reg_a (jump to arg2 if zero)
+                // Note: arg2 is already the 1-based line number, convert to 0-based
+                if (reg_a >= 0 && reg_a < MAX_REGISTERS && ctx->registers[reg_a] == 0) {
+                    pc = arg2 - 1;  // arg2 is 1-based line number
+                } else {
+                    pc++;
+                }
+                break;
+            }
+            
+            case OP_DEC: {
+                if (reg_a >= 0 && reg_a < MAX_REGISTERS && ctx->registers[reg_a] > 0) {
+                    ctx->registers[reg_a]--;
+                }
+                pc++;
+                break;
+            }
+            
+            case OP_INC: {
+                if (reg_a >= 0 && reg_a < MAX_REGISTERS) {
+                    ctx->registers[reg_a]++;
+                }
+                pc++;
+                break;
+            }
+            
+            case OP_COPY: {
+                if (reg_a >= 0 && reg_a < MAX_REGISTERS && 
+                    reg_b >= 0 && reg_b < MAX_REGISTERS) {
+                    ctx->registers[reg_b] = ctx->registers[reg_a];
+                }
+                pc++;
+                break;
+            }
+            
+            case OP_GOTO: {
+                // GOTO arg1 (1-based line number)
+                pc = arg1 - 1;
+                break;
+            }
+            
+            case OP_CLR: {
+                if (reg_a >= 0 && reg_a < MAX_REGISTERS) {
+                    ctx->registers[reg_a] = 0;
+                }
+                pc++;
+                break;
+            }
+            
+            case OP_HALT: {
+                result.steps = (int)step_count;
+                result.exceeded_limit = false;
+                result.error[0] = '\0';
+                return result;
+            }
+            
+            default: {
+                // Unknown opcode - should not happen with valid programs
+                result.steps = 0;
+                result.exceeded_limit = false;
+                strcpy(result.error, "Unknown opcode");
+                return result;
+            }
         }
     }
     
-    // Send program to server
-    // Write number of instructions
-    fprintf(ctx->stdin_stream, "%d\n", program->length);
-    
-    // Write each instruction
-    for (int i = 0; i < program->length; i++) {
-        char instr[64];
-        decode_instruction(program->instructions[i], instr, sizeof(instr));
-        fprintf(ctx->stdin_stream, "%s\n", instr);
-    }
-    
-    // Flush to ensure data is sent
-    fflush(ctx->stdin_stream);
-    
-    // Read result from server
-    char output[128];
-    if (!fgets(output, sizeof(output), ctx->stdout_stream)) {
-        strcpy(result.error, "Failed to read from server");
-        return result;
-    }
-    
-    // Parse result
-    int result_value;
-    if (sscanf(output, "%d", &result_value) != 1) {
-        snprintf(result.error, sizeof(result.error), "Invalid output: %s", output);
-        return result;
-    }
-    
-    ctx->programs_since_restart++;
-    
-    if (result_value > 0) {
-        // Halted successfully
-        result.steps = result_value;
-        result.exceeded_limit = false;
-    } else if (result_value == -1) {
-        // Exceeded step limit
-        result.steps = 0;
-        result.exceeded_limit = true;
-        strcpy(result.error, "Step limit exceeded");
-    } else if (result_value == -2) {
-        // Out of range
-        result.steps = 0;
-        result.exceeded_limit = false;
-        strcpy(result.error, "Out of range termination");
-    } else {
-        result.steps = 0;
-        result.exceeded_limit = false;
-        snprintf(result.error, sizeof(result.error), "Unknown result code: %d", result_value);
-    }
-    
+    // PC went out of range
+    result.steps = 0;
+    result.exceeded_limit = false;
+    strcpy(result.error, "Out of range termination");
     return result;
 }
 
@@ -702,12 +651,6 @@ void* producer_thread(void *arg) {
 void* worker_thread(void *arg) {
     WorkerContext *ctx = (WorkerContext*)arg;
     
-    // Start server process
-    if (!start_server_process(ctx)) {
-        fprintf(stderr, "Worker %d: Failed to start server\n", ctx->worker_id);
-        return NULL;
-    }
-    
     // Allocate program buffer
     Program program;
     program.length = ctx->num_instructions + 1;  // +1 for HALT
@@ -717,8 +660,8 @@ void* worker_thread(void *arg) {
     while (queue_pop(ctx->work_queue, &program)) {
         if (interrupted) break;
         
-        // Run program
-        ExecutionResult result = run_program_on_server(ctx, &program);
+        // Run program with inline execution (no subprocess overhead!)
+        ExecutionResult result = run_program_inline(ctx, &program);
         
         ctx->programs_tested++;
         
@@ -769,7 +712,7 @@ void* worker_thread(void *arg) {
     
     // Cleanup
     free_program(&program);  // Free the reused buffer once at the end
-    stop_server_process(ctx);
+    // No server process to stop - we use inline execution!
     
     return NULL;
 }
@@ -777,15 +720,20 @@ void* worker_thread(void *arg) {
 int main(int argc, char *argv[]) {
     // Parse arguments
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <num_instructions> [--max-register N] [--max-steps N] [--counter-machine PATH]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <num_instructions> [--max-register N] [--max-steps N] [--workers N]\n", argv[0]);
         return 1;
     }
     
     int num_instructions = atoi(argv[1]);
     int max_register = 3;
     int max_steps = 100000;
-    char counter_machine_path[512] = "../countermachine";
-    int num_workers = sysconf(_SC_NPROCESSORS_ONLN);
+    int num_workers = 4;  // Default to 4 workers
+    
+    // Try to get CPU count at runtime
+    #ifdef _SC_NPROCESSORS_ONLN
+    num_workers = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_workers < 1) num_workers = 4;
+    #endif
     
     // Parse optional arguments
     for (int i = 2; i < argc; i++) {
@@ -793,8 +741,6 @@ int main(int argc, char *argv[]) {
             max_register = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-steps") == 0 && i + 1 < argc) {
             max_steps = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--counter-machine") == 0 && i + 1 < argc) {
-            strncpy(counter_machine_path, argv[++i], sizeof(counter_machine_path) - 1);
         } else if (strcmp(argv[i], "--workers") == 0 && i + 1 < argc) {
             num_workers = atoi(argv[++i]);
         }
@@ -803,11 +749,6 @@ int main(int argc, char *argv[]) {
     // Validate
     if (num_instructions < 1) {
         fprintf(stderr, "Error: Number of instructions must be at least 1\n");
-        return 1;
-    }
-    
-    if (access(counter_machine_path, X_OK) != 0) {
-        fprintf(stderr, "Error: Counter machine executable not found at %s\n", counter_machine_path);
         return 1;
     }
     
@@ -828,14 +769,14 @@ int main(int argc, char *argv[]) {
     pthread_mutex_init(&best.lock, NULL);
     
     printf("======================================================================\n");
-    printf("BUSY BEAVER BRUTE FORCE SEARCH (C VERSION - PRODUCER-CONSUMER)\n");
+    printf("BUSY BEAVER BRUTE FORCE SEARCH (C VERSION - INLINE EXECUTION)\n");
     printf("======================================================================\n");
     printf("Instructions (excluding HALT): %d\n", num_instructions);
     printf("Max register: %d\n", max_register);
     printf("Max steps per program: %d\n", max_steps);
     printf("Parallel workers: %d\n", num_workers);
     printf("Work queue size: %d\n", QUEUE_SIZE);
-    printf("Counter machine: %s\n", counter_machine_path);
+    printf("Execution: INLINE (no subprocess overhead)\n");
     printf("======================================================================\n\n");
     
     // Create work queue
@@ -865,8 +806,6 @@ int main(int argc, char *argv[]) {
     
     for (int i = 0; i < num_workers; i++) {
         workers[i].worker_id = i;
-        strncpy(workers[i].counter_machine_path, counter_machine_path, 
-                sizeof(workers[i].counter_machine_path));
         workers[i].max_steps = max_steps;
         workers[i].max_register = max_register;
         workers[i].num_instructions = num_instructions;
@@ -876,8 +815,8 @@ int main(int argc, char *argv[]) {
         workers[i].programs_timed_out = 0;
         workers[i].programs_out_of_range = 0;
         workers[i].programs_errored = 0;
-        workers[i].server_pid = 0;
-        workers[i].programs_since_restart = 0;
+        // Pre-clear registers array (will be cleared again per-program)
+        memset(workers[i].registers, 0, sizeof(workers[i].registers));
         
         if (pthread_create(&threads[i], NULL, worker_thread, &workers[i]) != 0) {
             fprintf(stderr, "Failed to create worker thread %d\n", i);
