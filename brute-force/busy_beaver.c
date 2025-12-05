@@ -47,6 +47,7 @@ typedef struct {
 typedef struct ProgramGenerator ProgramGenerator;
 typedef struct SharedGenerator SharedGenerator;
 typedef struct WorkQueue WorkQueue;
+typedef struct CanonicalHashTable CanonicalHashTable;
 
 // Work queue for producer-consumer model
 struct WorkQueue {
@@ -100,6 +101,7 @@ typedef struct {
     WorkQueue *work_queue;
     int num_instructions;
     int max_register;
+    CanonicalHashTable *canonical_table;
 } ProducerContext;
 
 // Global statistics
@@ -114,6 +116,99 @@ typedef struct {
 
 static Statistics global_stats = {0};
 static volatile sig_atomic_t interrupted = 0;
+
+// Hash table for tracking canonical programs (to avoid duplicates)
+#define HASH_TABLE_SIZE 1000003  // Large prime number
+
+typedef struct HashNode {
+    EncodedInstruction *instructions;
+    int length;
+    struct HashNode *next;
+} HashNode;
+
+struct CanonicalHashTable {
+    HashNode **buckets;
+    int size;
+    pthread_mutex_t lock;
+    unsigned long unique_programs;
+    unsigned long duplicate_programs;
+};
+
+// Hash function for programs
+unsigned long hash_program(EncodedInstruction *instructions, int length) {
+    unsigned long hash = 5381;
+    for (int i = 0; i < length; i++) {
+        hash = ((hash << 5) + hash) + instructions[i]; // hash * 33 + instruction
+    }
+    return hash % HASH_TABLE_SIZE;
+}
+
+// Create hash table
+CanonicalHashTable* create_hash_table() {
+    CanonicalHashTable *table = malloc(sizeof(CanonicalHashTable));
+    table->size = HASH_TABLE_SIZE;
+    table->buckets = calloc(HASH_TABLE_SIZE, sizeof(HashNode*));
+    table->unique_programs = 0;
+    table->duplicate_programs = 0;
+    pthread_mutex_init(&table->lock, NULL);
+    return table;
+}
+
+// Check if program exists in hash table, add if not
+// Returns true if this is a new unique program, false if duplicate
+bool hash_table_add_if_unique(CanonicalHashTable *table, Program *program) {
+    unsigned long hash = hash_program(program->instructions, program->length);
+    
+    pthread_mutex_lock(&table->lock);
+    
+    // Check if program already exists
+    HashNode *node = table->buckets[hash];
+    while (node != NULL) {
+        if (node->length == program->length) {
+            bool match = true;
+            for (int i = 0; i < program->length; i++) {
+                if (node->instructions[i] != program->instructions[i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                table->duplicate_programs++;
+                pthread_mutex_unlock(&table->lock);
+                return false;  // Duplicate found
+            }
+        }
+        node = node->next;
+    }
+    
+    // Not found, add it
+    HashNode *new_node = malloc(sizeof(HashNode));
+    new_node->length = program->length;
+    new_node->instructions = malloc(program->length * sizeof(EncodedInstruction));
+    memcpy(new_node->instructions, program->instructions, program->length * sizeof(EncodedInstruction));
+    new_node->next = table->buckets[hash];
+    table->buckets[hash] = new_node;
+    table->unique_programs++;
+    
+    pthread_mutex_unlock(&table->lock);
+    return true;  // Unique program
+}
+
+// Free hash table
+void free_hash_table(CanonicalHashTable *table) {
+    for (int i = 0; i < table->size; i++) {
+        HashNode *node = table->buckets[i];
+        while (node != NULL) {
+            HashNode *next = node->next;
+            free(node->instructions);
+            free(node);
+            node = next;
+        }
+    }
+    free(table->buckets);
+    pthread_mutex_destroy(&table->lock);
+    free(table);
+}
 
 // Signal handler for Ctrl+C
 void signal_handler(int sig) {
@@ -274,6 +369,159 @@ bool has_obvious_infinite_loop(Program *program) {
     }
     
     return false;
+}
+
+// Canonicalize program: renumber states in order of first encounter
+// Entry line (line 1) is always state 0
+// As we traverse the program, assign new numbers to jump targets in order seen
+void canonicalize_program(Program *program, Program *canonical) {
+    if (program->length < 1) {
+        canonical->length = 0;
+        canonical->instructions = NULL;
+        return;
+    }
+    
+    // Allocate canonical program
+    canonical->length = program->length;
+    canonical->instructions = malloc(canonical->length * sizeof(EncodedInstruction));
+    
+    // Mapping from old line number (1-based) to new line number (1-based)
+    // -1 means not yet mapped
+    int *line_mapping = malloc((program->length + 1) * sizeof(int));
+    for (int i = 0; i <= program->length; i++) {
+        line_mapping[i] = -1;
+    }
+    
+    // Queue for BFS traversal to determine canonical ordering
+    int *queue = malloc(program->length * sizeof(int));
+    int queue_head = 0;
+    int queue_tail = 0;
+    
+    int next_canonical_line = 1;
+    
+    // Start with line 1 (entry point)
+    line_mapping[1] = 1;
+    queue[queue_tail++] = 1;
+    
+    // BFS to discover reachable states in canonical order
+    while (queue_head < queue_tail) {
+        int current_line = queue[queue_head++];
+        int current_idx = current_line - 1;
+        
+        if (current_idx >= program->length - 1) continue; // HALT or out of bounds
+        
+        // Decode current instruction
+        EncodedInstruction encoded = program->instructions[current_idx];
+        Opcode opcode = (encoded >> 16) & 0x7;
+        int arg1 = (encoded >> 8) & 0xFF;
+        int arg2 = encoded & 0xFF;
+        
+        // Find jump targets and natural continuation
+        int targets[2] = {-1, -1};
+        int num_targets = 0;
+        
+        switch (opcode) {
+            case OP_IF:
+                // Can jump to arg2, or continue to next line
+                targets[num_targets++] = current_line + 1; // Natural continuation first
+                if (arg2 >= 1 && arg2 <= program->length) {
+                    targets[num_targets++] = arg2; // Jump target
+                }
+                break;
+                
+            case OP_GOTO:
+                // Unconditional jump to arg1
+                if (arg1 >= 1 && arg1 <= program->length) {
+                    targets[num_targets++] = arg1;
+                }
+                break;
+                
+            case OP_DEC:
+            case OP_INC:
+            case OP_COPY:
+            case OP_CLR:
+                // Continue to next line
+                targets[num_targets++] = current_line + 1;
+                break;
+                
+            case OP_HALT:
+                // No continuation
+                break;
+                
+            default:
+                break;
+        }
+        
+        // Add unmapped targets to queue in order
+        for (int i = 0; i < num_targets; i++) {
+            int target = targets[i];
+            if (target >= 1 && target <= program->length && line_mapping[target] == -1) {
+                next_canonical_line++;
+                line_mapping[target] = next_canonical_line;
+                queue[queue_tail++] = target;
+            }
+        }
+    }
+    
+    // Map unreachable lines (if any) to the end in original order
+    for (int i = 1; i <= program->length; i++) {
+        if (line_mapping[i] == -1) {
+            next_canonical_line++;
+            line_mapping[i] = next_canonical_line;
+        }
+    }
+    
+    // Build canonical program by remapping line numbers in instructions
+    for (int i = 0; i < program->length; i++) {
+        EncodedInstruction encoded = program->instructions[i];
+        Opcode opcode = (encoded >> 16) & 0x7;
+        int arg1 = (encoded >> 8) & 0xFF;
+        int arg2 = encoded & 0xFF;
+        
+        // Remap jump targets
+        switch (opcode) {
+            case OP_IF:
+                // Remap arg2 (jump target)
+                if (arg2 >= 1 && arg2 <= program->length) {
+                    arg2 = line_mapping[arg2];
+                }
+                break;
+                
+            case OP_GOTO:
+                // Remap arg1 (jump target)
+                if (arg1 >= 1 && arg1 <= program->length) {
+                    arg1 = line_mapping[arg1];
+                }
+                break;
+                
+            default:
+                // Other instructions don't have jump targets
+                break;
+        }
+        
+        // Re-encode with remapped arguments
+        canonical->instructions[i] = (opcode << 16) | (arg1 << 8) | arg2;
+    }
+    
+    // Now we need to physically reorder the instructions based on the mapping
+    // Create a temporary copy in canonical order
+    EncodedInstruction *temp = malloc(program->length * sizeof(EncodedInstruction));
+    
+    // Find which original line goes to each canonical position
+    for (int old_line = 1; old_line <= program->length; old_line++) {
+        int new_line = line_mapping[old_line];
+        if (new_line >= 1 && new_line <= program->length) {
+            temp[new_line - 1] = canonical->instructions[old_line - 1];
+        }
+    }
+    
+    // Copy back
+    memcpy(canonical->instructions, temp, program->length * sizeof(EncodedInstruction));
+    
+    // Cleanup
+    free(temp);
+    free(queue);
+    free(line_mapping);
 }
 
 // Inline counter machine execution - no subprocess overhead!
@@ -439,7 +687,7 @@ ProgramGenerator* create_program_generator(int num_instructions, int max_registe
     
     printf("Total programs to generate: %llu\n", total);
     printf("Mode: ITERATIVE\n");
-    printf("Filters: ENABLED\n\n");
+    printf("Filters: DISABLED (all programs will be tested)\n\n");
     
     return gen;
 }
@@ -480,45 +728,8 @@ bool next_program(ProgramGenerator *gen, Program *program, bool use_optimization
         }
         program->instructions[gen->num_positions] = encode_instruction("HALT");
         
-        // Apply filters if optimization is enabled
-        if (!use_optimization) {
-            return true;
-        }
-        
-        if (!is_halt_reachable(program)) {
-            // Don't free - we're reusing the buffer
-            
-            // Increment for next iteration
-            int pos = gen->num_positions - 1;
-            while (pos >= 0) {
-                gen->indices[pos]++;
-                if (gen->indices[pos] < gen->position_instructions[pos].count) {
-                    break;
-                }
-                gen->indices[pos] = 0;
-                pos--;
-            }
-            if (pos < 0) return false;
-            continue;
-        }
-        
-        if (has_obvious_infinite_loop(program)) {
-            // Don't free - we're reusing the buffer
-            
-            // Increment for next iteration
-            int pos = gen->num_positions - 1;
-            while (pos >= 0) {
-                gen->indices[pos]++;
-                if (gen->indices[pos] < gen->position_instructions[pos].count) {
-                    break;
-                }
-                gen->indices[pos] = 0;
-                pos--;
-            }
-            if (pos < 0) return false;
-            continue;
-        }
-        
+        // Search space reduction optimizations DISABLED
+        // All programs will be tested without filtering
         return true;
     } while (1);
 }
@@ -635,10 +846,23 @@ void* producer_thread(void *arg) {
     program.length = ctx->num_instructions + 1;  // +1 for HALT
     program.instructions = malloc(program.length * sizeof(EncodedInstruction));
     
+    Program canonical;
+    
     while (next_program(ctx->generator, &program, true) && !interrupted) {
-        if (!queue_push(ctx->work_queue, &program)) {
-            break;
+        // Canonicalize the program
+        canonicalize_program(&program, &canonical);
+        
+        // Check if this canonical form is unique
+        if (hash_table_add_if_unique(ctx->canonical_table, &canonical)) {
+            // Unique program - add to work queue
+            if (!queue_push(ctx->work_queue, &canonical)) {
+                free_program(&canonical);
+                break;
+            }
         }
+        
+        // Free canonical program (queue_push makes a copy)
+        free_program(&canonical);
     }
     
     free(program.instructions);
@@ -780,12 +1004,17 @@ int main(int argc, char *argv[]) {
     printf("Parallel workers: %d\n", num_workers);
     printf("Work queue size: %d\n", QUEUE_SIZE);
     printf("Execution: INLINE (no subprocess overhead)\n");
+    printf("Canonicalization: ENABLED (syntactic state numbering)\n");
     printf("======================================================================\n\n");
+    
+    // Create canonical hash table
+    CanonicalHashTable *canonical_table = create_hash_table();
     
     // Create work queue
     WorkQueue *queue = create_work_queue(QUEUE_SIZE, num_instructions + 1);
     if (!queue) {
         fprintf(stderr, "Failed to create work queue\n");
+        free_hash_table(canonical_table);
         return 1;
     }
     
@@ -794,6 +1023,7 @@ int main(int argc, char *argv[]) {
     prod_ctx.work_queue = queue;
     prod_ctx.generator = create_program_generator(num_instructions, max_register);
     prod_ctx.num_instructions = num_instructions;
+    prod_ctx.canonical_table = canonical_table;
     
     pthread_t producer;
     if (pthread_create(&producer, NULL, producer_thread, &prod_ctx) != 0) {
@@ -861,6 +1091,8 @@ int main(int argc, char *argv[]) {
     printf("\n======================================================================\n");
     printf("SEARCH COMPLETE\n");
     printf("======================================================================\n");
+    printf("Unique canonical programs: %lu\n", canonical_table->unique_programs);
+    printf("Duplicate programs filtered: %lu\n", canonical_table->duplicate_programs);
     printf("Programs tested: %lu\n", total_tested);
     printf("Programs exceeded step limit: %lu\n", total_timed_out);
     printf("Programs went out of range: %lu\n", total_out_of_range);
@@ -884,6 +1116,7 @@ int main(int argc, char *argv[]) {
     free(threads);
     free_program_generator(prod_ctx.generator);
     free_work_queue(queue);
+    free_hash_table(canonical_table);
     pthread_mutex_destroy(&best.lock);
     pthread_mutex_destroy(&global_stats.lock);
     
