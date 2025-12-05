@@ -132,6 +132,7 @@ struct CanonicalHashTable {
     pthread_mutex_t lock;
     unsigned long unique_programs;
     unsigned long duplicate_programs;
+    unsigned long unreachable_halt_filtered;
 };
 
 // Hash function for programs
@@ -150,6 +151,7 @@ CanonicalHashTable* create_hash_table() {
     table->buckets = calloc(HASH_TABLE_SIZE, sizeof(HashNode*));
     table->unique_programs = 0;
     table->duplicate_programs = 0;
+    table->unreachable_halt_filtered = 0;
     pthread_mutex_init(&table->lock, NULL);
     return table;
 }
@@ -524,6 +526,178 @@ void canonicalize_program(Program *program, Program *canonical) {
     free(line_mapping);
 }
 
+// Control Flow Graph (CFG) structure
+typedef struct {
+    int *successors;      // Array of successor indices
+    int num_successors;   // Number of successors
+} CFGNode;
+
+typedef struct {
+    CFGNode *nodes;
+    int num_nodes;
+} CFG;
+
+// Build CFG for a program
+CFG* build_cfg(Program *program) {
+    CFG *cfg = malloc(sizeof(CFG));
+    cfg->num_nodes = program->length;
+    cfg->nodes = malloc(program->length * sizeof(CFGNode));
+    
+    // Initialize nodes
+    for (int i = 0; i < program->length; i++) {
+        cfg->nodes[i].successors = malloc(2 * sizeof(int));  // Max 2 successors
+        cfg->nodes[i].num_successors = 0;
+    }
+    
+    // Build edges based on control flow
+    for (int i = 0; i < program->length; i++) {
+        EncodedInstruction encoded = program->instructions[i];
+        Opcode opcode = (encoded >> 16) & 0x7;
+        int arg1 = (encoded >> 8) & 0xFF;
+        int arg2 = encoded & 0xFF;
+        
+        switch (opcode) {
+            case OP_IF: {
+                // Conditional: can go to next instruction OR jump to arg2
+                // Fallthrough to next
+                if (i + 1 < program->length) {
+                    cfg->nodes[i].successors[cfg->nodes[i].num_successors++] = i + 1;
+                }
+                // Jump target (arg2 is 1-based line number)
+                int target = arg2 - 1;  // Convert to 0-based
+                if (target >= 0 && target < program->length) {
+                    cfg->nodes[i].successors[cfg->nodes[i].num_successors++] = target;
+                }
+                break;
+            }
+            
+            case OP_GOTO: {
+                // Unconditional jump to arg1 (1-based line number)
+                int target = arg1 - 1;  // Convert to 0-based
+                if (target >= 0 && target < program->length) {
+                    cfg->nodes[i].successors[cfg->nodes[i].num_successors++] = target;
+                }
+                break;
+            }
+            
+            case OP_DEC:
+            case OP_INC:
+            case OP_COPY:
+            case OP_CLR: {
+                // Fallthrough to next instruction
+                if (i + 1 < program->length) {
+                    cfg->nodes[i].successors[cfg->nodes[i].num_successors++] = i + 1;
+                }
+                break;
+            }
+            
+            case OP_HALT: {
+                // No successors - terminal node
+                break;
+            }
+            
+            default:
+                break;
+        }
+    }
+    
+    return cfg;
+}
+
+// Free CFG
+void free_cfg(CFG *cfg) {
+    for (int i = 0; i < cfg->num_nodes; i++) {
+        free(cfg->nodes[i].successors);
+    }
+    free(cfg->nodes);
+    free(cfg);
+}
+
+// Check if HALT is reachable from entry point using BFS
+bool is_halt_reachable_cfg(Program *program) {
+    if (program->length == 0) return false;
+    
+    // Build CFG
+    CFG *cfg = build_cfg(program);
+    
+    // Find HALT instruction index
+    int halt_idx = -1;
+    for (int i = 0; i < program->length; i++) {
+        EncodedInstruction encoded = program->instructions[i];
+        Opcode opcode = (encoded >> 16) & 0x7;
+        if (opcode == OP_HALT) {
+            halt_idx = i;
+            break;
+        }
+    }
+    
+    if (halt_idx == -1) {
+        free_cfg(cfg);
+        return false;  // No HALT instruction
+    }
+    
+    // BFS from entry point (index 0) to find reachable nodes
+    bool *visited = calloc(program->length, sizeof(bool));
+    int *queue = malloc(program->length * sizeof(int));
+    int queue_head = 0;
+    int queue_tail = 0;
+    
+    // Start from entry point
+    visited[0] = true;
+    queue[queue_tail++] = 0;
+    
+    bool halt_reachable = false;
+    
+    while (queue_head < queue_tail) {
+        int current = queue[queue_head++];
+        
+        // Check if we reached HALT
+        if (current == halt_idx) {
+            halt_reachable = true;
+            break;
+        }
+        
+        // Visit successors
+        CFGNode *node = &cfg->nodes[current];
+        for (int i = 0; i < node->num_successors; i++) {
+            int successor = node->successors[i];
+            if (!visited[successor]) {
+                visited[successor] = true;
+                queue[queue_tail++] = successor;
+            }
+        }
+    }
+    
+    // Cleanup
+    free(queue);
+    free(visited);
+    free_cfg(cfg);
+    
+    return halt_reachable;
+}
+
+// Print CFG for debugging (useful for testing)
+void print_cfg(Program *program, CFG *cfg) {
+    printf("\n=== Control Flow Graph ===\n");
+    for (int i = 0; i < cfg->num_nodes; i++) {
+        char instr[64];
+        decode_instruction(program->instructions[i], instr, sizeof(instr));
+        printf("Node %d (%s): ", i, instr);
+        
+        if (cfg->nodes[i].num_successors == 0) {
+            printf("(no successors)\n");
+        } else {
+            printf("→ ");
+            for (int j = 0; j < cfg->nodes[i].num_successors; j++) {
+                if (j > 0) printf(", ");
+                printf("%d", cfg->nodes[i].successors[j]);
+            }
+            printf("\n");
+        }
+    }
+    printf("==========================\n\n");
+}
+
 // Inline counter machine execution - no subprocess overhead!
 // Directly executes the encoded program and returns result
 ExecutionResult run_program_inline(WorkerContext *ctx, Program *program) {
@@ -852,6 +1026,17 @@ void* producer_thread(void *arg) {
         // Canonicalize the program
         canonicalize_program(&program, &canonical);
         
+        // CFG + Reachability filter: Check if HALT is reachable
+        if (!is_halt_reachable_cfg(&canonical)) {
+            // HALT is not reachable - this program can never halt
+            pthread_mutex_lock(&ctx->canonical_table->lock);
+            ctx->canonical_table->unreachable_halt_filtered++;
+            pthread_mutex_unlock(&ctx->canonical_table->lock);
+            
+            free_program(&canonical);
+            continue;  // Skip this program
+        }
+        
         // Check if this canonical form is unique
         if (hash_table_add_if_unique(ctx->canonical_table, &canonical)) {
             // Unique program - add to work queue
@@ -1005,6 +1190,7 @@ int main(int argc, char *argv[]) {
     printf("Work queue size: %d\n", QUEUE_SIZE);
     printf("Execution: INLINE (no subprocess overhead)\n");
     printf("Canonicalization: ENABLED (syntactic state numbering)\n");
+    printf("CFG Reachability: ENABLED (filter unreachable HALT)\n");
     printf("======================================================================\n\n");
     
     // Create canonical hash table
@@ -1091,6 +1277,7 @@ int main(int argc, char *argv[]) {
     printf("\n======================================================================\n");
     printf("SEARCH COMPLETE\n");
     printf("======================================================================\n");
+    printf("Programs with unreachable HALT filtered: %lu\n", canonical_table->unreachable_halt_filtered);
     printf("Unique canonical programs: %lu\n", canonical_table->unique_programs);
     printf("Duplicate programs filtered: %lu\n", canonical_table->duplicate_programs);
     printf("Programs tested: %lu\n", total_tested);
