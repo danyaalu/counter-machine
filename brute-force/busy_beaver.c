@@ -701,8 +701,11 @@ void* worker_thread(void *arg) {
             global_stats.programs_tested += 100;
             
             if (global_stats.programs_tested % 1000 == 0) {
-                printf("Progress: %lu tested - best: %d steps\n", 
-                       global_stats.programs_tested, ctx->best->steps);
+                pthread_mutex_lock(&ctx->work_queue->lock);
+                int queue_size = ctx->work_queue->size;
+                pthread_mutex_unlock(&ctx->work_queue->lock);
+                printf("Progress: %lu tested - best: %d steps - queue: %d\n", 
+                       global_stats.programs_tested, ctx->best->steps, queue_size);
             }
             pthread_mutex_unlock(&global_stats.lock);
         }
